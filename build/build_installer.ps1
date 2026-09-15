@@ -35,7 +35,8 @@ function Find-Iscc {
 $iscc = Find-Iscc
 if (-not $iscc) {
     Write-Host "`n[1/3] 未找到 Inno Setup，自动下载安装（约 10 MB）..." -ForegroundColor Yellow
-    $dl = Join-Path $env:TEMP "innosetup-6.7.3.exe"
+    # 用随机临时名，避免固定路径被预先放置的同名文件顶替
+    $dl = Join-Path $env:TEMP ("innosetup-6.7.3-" + [guid]::NewGuid().ToString("N") + ".exe")
     $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
     Write-Host "      下载 $url"
     try {
@@ -43,9 +44,25 @@ if (-not $iscc) {
     } catch {
         throw "下载 Inno Setup 失败：$_`n请手动安装：https://jrsoftware.org/isdl.php"
     }
+    # 执行外部可执行文件前必须验签：未校验就静默安装，一旦下载被劫持或替换，
+    # 等于在本机直接运行攻击者代码（并污染后续所有安装包）。
+    $sig = Get-AuthenticodeSignature -FilePath $dl
+    if ($sig.Status -ne "Valid") {
+        Remove-Item $dl -Force -ErrorAction SilentlyContinue
+        throw ("Inno Setup 安装包签名校验失败（$($sig.Status)），已删除下载文件并终止。`n" +
+               "如需继续，请手动安装：https://jrsoftware.org/isdl.php")
+    }
+    if ($sig.SignerCertificate.Subject -notmatch "JRSoftware") {
+        Remove-Item $dl -Force -ErrorAction SilentlyContinue
+        throw "Inno Setup 签名者不是 JRSoftware，已终止（签名者：$($sig.SignerCertificate.Subject)）"
+    }
     $dir = Join-Path $env:USERPROFILE "InnoSetup6"
-    Write-Host "      静默安装到 $dir"
-    Start-Process -FilePath $dl -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/DIR=$dir" -Wait
+    Write-Host "      签名有效，静默安装到 $dir"
+    try {
+        Start-Process -FilePath $dl -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/DIR=$dir" -Wait
+    } finally {
+        Remove-Item $dl -Force -ErrorAction SilentlyContinue
+    }
     $iscc = Join-Path $dir "ISCC.exe"
 }
 if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe，请手动安装 Inno Setup" }

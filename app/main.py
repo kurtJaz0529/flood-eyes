@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import html
 import os
 import sys
 import traceback
@@ -56,6 +58,19 @@ OUT_DIR = outputs_dir()
 # --------------------------------------------------------------------------
 
 GRADIO_MAJOR = int(gr.__version__.split(".")[0])
+
+
+def _esc(value: Any) -> str:
+    """转义插入 HTML 的文本（gr.HTML 按 innerHTML 渲染）。"""
+    return html.escape(str(value), quote=True)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
 
 
 def _load_apple_css() -> str:
@@ -189,18 +204,22 @@ def _resolve_weights(weights: Optional[str]) -> Optional[str]:
         probe = os.path.join(d, os.path.basename(weights))
         if os.path.isfile(probe):
             return probe
-    return None
+    # 用户显式选了权重却找不到文件时不能静默返回 None：
+    # 那样界面仍显示 U-Net，实际跑的是基线，属于"假成功"。
+    raise gr.Error(f"找不到所选权重文件：{weights}（已搜索：{weights_dirs()}）")
 
 
 def _coerce_pixel_size(value: Any) -> Optional[float]:
-    """0 / 空 = 从影像读取分辨率。"""
+    """0 / 空 = 从影像读取分辨率；非法值必须报错，不能静默改用默认值。"""
     if value is None or value == "":
         return None
     try:
         x = float(value)
     except (TypeError, ValueError):
-        return None
-    return None if x <= 0 else x
+        raise gr.Error(f"像元大小必须是数字，收到：{value!r}") from None
+    if not np.isfinite(x) or x < 0:
+        raise gr.Error(f"像元大小必须是非负数字，收到：{value!r}")
+    return None if x == 0 else x
 
 
 def _make_detector(
@@ -314,8 +333,14 @@ def show_model_info(mode_label: str, weights: Optional[str]) -> str:
 _SAR_CSS = ""
 
 
+@functools.lru_cache(maxsize=None)
 def _load_script(name: str) -> Any:
-    """按路径加载 scripts/*.py，打包后也能找到。"""
+    """按路径加载 scripts/*.py，打包后也能找到。
+
+    结果按名字缓存：原实现每次调用都 exec_module，而 _preset_events /
+    _nearest_preset / _preset_map_points 会被频繁调用，脚本模块级代码
+    （含耗时或写盘逻辑）会被反复执行。
+    """
     import importlib.util
 
     path = os.path.join(ROOT, "scripts", f"{name}.py")
@@ -329,37 +354,62 @@ def _load_script(name: str) -> Any:
     return mod
 
 
+@functools.lru_cache(maxsize=1)
 def _preset_events() -> Dict[str, Dict[str, Any]]:
-    return _load_script("fetch_real_samples").EVENTS
+    """预设事件表。
+
+    优先用内置事件库（data/events/flood_events.json，含 17 起历史洪灾），
+    再补上 fetch_real_samples.EVENTS 里事件库没有的条目。
+    返回结构与原来完全一致（label/aoi/pre/post/size/note），下游无需改动；
+    事件 id 保持不变，因此本地缓存影像（data/real/{id}_pre.tif）仍能命中。
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    try:
+        from src.events import templates_for
+
+        merged.update(templates_for())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] 事件库不可用，回退到内置脚本事件：{type(exc).__name__}: {exc}")
+    try:
+        for key, cfg in _load_script("fetch_real_samples").EVENTS.items():
+            merged.setdefault(key, cfg)
+    except Exception as exc:  # noqa: BLE001
+        if not merged:
+            print(f"[warn] 内置脚本事件也读取失败：{type(exc).__name__}: {exc}")
+    return merged
 
 
 def _sar_stats_html(result: Dict[str, Any]) -> str:
     s = result["stats"]
     p = result["provenance"]
     lonlat = p.get("aoi_lonlat") or [0, 0]
-    lon, lat = lonlat[0], lonlat[1]
-    src = p.get("aoi_source") or p.get("source") or "-"
+    lon, lat = _safe_float(lonlat[0]), _safe_float(lonlat[1])
+    # pre_scene / aoi_source 等字段直接来自远端 STAC 元数据，必须转义后再拼 HTML。
+    src = _esc(p.get("aoi_source") or p.get("source") or "-")
+    new_km2 = _safe_float(s.get("new_water_km2"))
+    window = p.get("window") or [0, 0]
+    bar = min(100.0, 100.0 * new_km2 / max(_safe_float(s.get("window_km2")), 1.0))
     return f"""
 <div class="heye-stats">
   <div class="heye-hero">
     <div class="t">新增淹没面积</div>
-    <div class="n danger">{s['new_water_km2']:,.2f}<small> km²</small></div>
-    <div class="heye-bar"><i style="width:{min(100.0, 100 * s['new_water_km2'] / max(s['window_km2'], 1)):.1f}%"></i></div>
+    <div class="n danger">{new_km2:,.2f}<small> km²</small></div>
+    <div class="heye-bar"><i style="width:{bar:.1f}%"></i></div>
   </div>
   <div>
-    <span class="heye-tag info">Sentinel-1 {p['polarization']}</span>
-    <span class="heye-tag">阈值 {s['threshold_db']:.1f} dB</span>
-    <span class="heye-tag">窗口 {p['window'][0]}×{p['window'][1]}</span>
+    <span class="heye-tag info">Sentinel-1 {_esc(p.get('polarization', '-'))}</span>
+    <span class="heye-tag">阈值 {_safe_float(s.get('threshold_db')):.1f} dB</span>
+    <span class="heye-tag">窗口 {int(_safe_float(window[0]))}×{int(_safe_float(window[1]))}</span>
     <span class="heye-tag">定位 {src} @ {lon},{lat}</span>
   </div>
   <div class="heye-grid">
-    <div class="heye-card"><div class="k">灾前水体</div><div class="v">{s['pre_water_km2']:.2f}<small> km²</small></div></div>
-    <div class="heye-card"><div class="k">灾后水体</div><div class="v">{s['post_water_km2']:.2f}<small> km²</small></div></div>
-    <div class="heye-card"><div class="k">持续水体</div><div class="v">{s['persistent_km2']:.2f}<small> km²</small></div></div>
-    <div class="heye-card"><div class="k">退水面积</div><div class="v" style="color:var(--success)">{s['receded_km2']:.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">灾前水体</div><div class="v">{_safe_float(s.get('pre_water_km2')):.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">灾后水体</div><div class="v">{_safe_float(s.get('post_water_km2')):.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">持续水体</div><div class="v">{_safe_float(s.get('persistent_km2')):.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">退水面积</div><div class="v" style="color:var(--success)">{_safe_float(s.get('receded_km2')):.2f}<small> km²</small></div></div>
   </div>
   <div style="font-size:12px;color:#5b6b7f;margin-top:6px">
-    灾前景 {p['pre_scene'][:46]}…<br>灾后景 {p['post_scene'][:46]}…
+    灾前景 {_esc(str(p.get('pre_scene', '-'))[:46])}…<br>灾后景 {_esc(str(p.get('post_scene', '-'))[:46])}…
   </div>
 </div>"""
 
@@ -592,6 +642,10 @@ def _pipeline_body(
     used = None
     rtc = None
     pre_path = post_path = None
+    # entry 只在"联网抓取"分支里赋值；命中本地缓存时不会走到那里。
+    # 必须先初始化，否则后面读取溯源信息会抛 UnboundLocalError——
+    # 而命中缓存恰恰是演示路径（点预设点），必须可用。
+    entry: Optional[Dict[str, Any]] = None
 
     if cached:
         pre_path, post_path = cached
@@ -608,7 +662,10 @@ def _pipeline_body(
             with contextlib.redirect_stdout(tee):
                 entry = fs.fetch_event(
                     sid, cfg, out_dir, size=size, max_cloud=60.0,
-                    allow_cloudy=True, fast=True, budget_s=None,
+                    allow_cloudy=True, fast=True,
+                    # 给整轮抓取一个硬超时：原先传 None，前端只有 8 秒心跳提示，
+                    # 网络卡死时任务会无限期挂起且用户无法中断。
+                    budget_s=300,
                 )
         except Exception as exc:
             prog(f"光学下载失败：{type(exc).__name__}: {exc}")
@@ -631,6 +688,13 @@ def _pipeline_body(
     prog("正在识别并对比（NDWI 基线）…")
     det = FloodDetector(mode="baseline")
     result = det.compare(pre_path, post_path)
+    # 把卫星影像溯源（用了哪几景、景云量、数据源）带进结果，
+    # 随成果包的 stats.json / PDF 一起交付——应急研判需要能追到原始影像。
+    if isinstance(entry, dict) and entry.get("provenance"):
+        result.meta["provenance"] = entry["provenance"]
+    if nearby:
+        result.meta["matched_event"] = {"id": nearby,
+                                        "label": _preset_events().get(nearby, {}).get("label", nearby)}
     bundled = export_bundle(result, out_dir=out_dir, basename=sid)
     change = result.change or {}
     slider = _slider_pair(change.get("before_overlay", result.rgb), change.get("after_overlay", result.overlay))
@@ -740,13 +804,23 @@ def _preset_map_points() -> List[Dict[str, Any]]:
 
 
 def _map_engine_js() -> str:
-    """无外部 Leaflet：用高德/智图瓦片在页面内画地图（国内可访问）。"""
+    """无外部 Leaflet：用高德瓦片在页面内画地图（国内可访问）。"""
     import json
 
     presets = json.dumps(_preset_map_points(), ensure_ascii=False)
+    # 防止预设文案里的 "</script>" 之类把注入点截断
+    presets = presets.replace("</", "<\\/")
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heye_map.js")
-    with open(path, encoding="utf-8") as fh:
-        body = fh.read()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as exc:
+        # 地图脚本缺失不应该让整个应用起不来：退化为一段提示，其余功能照常。
+        print(f"[warn] 地图脚本 heye_map.js 读取失败({type(exc).__name__})，地图将不可用")
+        body = (
+            "(function(){var r=element.querySelector('#heye-map')||element;"
+            "r.innerHTML='<div class=\"heye-empty\">地图脚本缺失，请手动填写经纬度</div>';})();"
+        )
     return f"window.__HEYE_PRESETS = {presets};\n{body}"
 
 
@@ -830,7 +904,77 @@ def apply_map_point(
             note = f"已写入 {_preset_events()[nearby].get('label', nearby)}  {lon_v:.4f}, {lat_v:.4f}"
         except Exception:
             pass
+    else:
+        # 不在预设点上时，告诉用户附近有哪些已知洪灾事件——
+        # 否则很容易出现"随便点一个位置 + 默认日期"导致结果为 0 的困惑。
+        note += _nearby_event_note(lon_v, lat_v)
     return lon_v, lat_v, note, pre_start, pre_end, post_start, post_end
+
+
+def _nearby_event_note(lon: float, lat: float, max_km: float = 300.0) -> str:
+    """给"附近有哪些已知洪灾事件"的提示文案（无则返回空串）。"""
+    try:
+        from src.events import nearest_events
+
+        hits = nearest_events(lon, lat, max_km=max_km, limit=2)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not hits:
+        return ""
+    parts = [f"{e.label}（{e.event_date}，约 {d:.0f} km）" for d, e in hits]
+    return "\n\n💡 附近已知洪灾事件：" + "；".join(parts) + \
+           "\n　 想分析这些事件，请点地图上的圆点或在上方「检索历史洪灾事件」里载入——" \
+           "直接点空白处时间范围可能与该地实际汛情不符，容易得出 0 km²。"
+
+
+# --------------------------------------------------------------------------
+# 事件库：检索 + 一键填表
+# --------------------------------------------------------------------------
+
+
+def search_event_library(query: str):
+    """检索内置事件库，返回（下拉选项, 提示）。"""
+    try:
+        from src.events import load_registry, search_events
+
+        events = load_registry()
+        hits = search_events(query or "", events=events, limit=50)
+    except Exception as exc:  # noqa: BLE001
+        return gr.update(choices=[], value=None), \
+            f"事件库不可用：{type(exc).__name__}: {exc}"
+    if not hits:
+        return gr.update(choices=[], value=None), (
+            "没有匹配的事件。可以换关键词（如「鄱阳湖」「湖南」「2024」），"
+            "或用命令行联网发现新事件：\n"
+            "`python scripts/events.py --online --from 2024-06-01 --to 2024-12-31 --save`"
+        )
+    choices = [(f"{e.event_date}｜{e.label}", e.id) for e in hits]
+    return gr.update(choices=choices, value=choices[0][1]), \
+        f"匹配到 {len(hits)} 起事件，选一个后点「载入并填表」。"
+
+
+def load_event_template(event_id: Optional[str]):
+    """把事件模板填进界面：坐标 + 灾前/灾后四个日期，并给出事件背景。"""
+    if not event_id:
+        raise gr.Error("请先搜索并选择一个事件")
+    try:
+        from src.events import build_template, load_registry, template_hint
+    except Exception as exc:  # noqa: BLE001
+        raise gr.Error(f"事件库不可用：{type(exc).__name__}: {exc}") from exc
+
+    event = next((e for e in load_registry() if e.id == event_id), None)
+    if event is None:
+        raise gr.Error(f"事件库里没有找到：{event_id}")
+
+    tpl = build_template(event)
+    lon, lat = tpl["aoi"]
+    pre, post = tpl["pre"], tpl["post"]
+    hint = template_hint(event)
+    if not tpl["analysable"]:
+        hint += "　⚠️ 该事件早于 Sentinel-2 可用日期（2015-06-23），本项目取不到影像。"
+    if tpl["precision"] != "aoi":
+        hint += "　⚠️ 坐标为事件区域近似中心，建议在地图上确认具体受淹区。"
+    return (float(lon), float(lat), pre[0], pre[1], post[0], post[1], hint)
 
 
 # --------------------------------------------------------------------------
@@ -858,9 +1002,27 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
                 )
             with gr.Column(scale=5, min_width=340, elem_classes=["heye-panel"]):
                 gr.HTML('<div class="heye-sec-title">① 选点与时间</div>')
+                # —— 事件库：检索历史洪灾事件 → 一键填表 ——
+                with gr.Row():
+                    event_q = gr.Textbox(
+                        label="检索历史洪灾事件",
+                        placeholder="如：鄱阳湖 / 湖南 / 2024 / 郑州",
+                        scale=7,
+                        elem_classes=["heye-mini"],
+                    )
+                    event_search_btn = gr.Button("搜索事件", scale=3, min_width=92)
+                with gr.Row():
+                    event_pick = gr.Dropdown(
+                        label="匹配到的事件（坐标与时间将自动填入）",
+                        choices=[],
+                        value=None,
+                        scale=8,
+                    )
+                    event_load_btn = gr.Button("载入并填表", variant="primary", scale=4,
+                                               min_width=104, elem_classes=["heye-primary"])
                 with gr.Row():
                     place_q = gr.Textbox(
-                        label="搜索地名",
+                        label="或按地名定位",
                         placeholder="例如：鄱阳湖、涿州、洞庭湖",
                         scale=7,
                         elem_classes=["heye-mini"],
@@ -925,6 +1087,27 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
             "window._heyeLon ?? lon, window._heyeLat ?? lat, "
             "window._heyePreStart ?? a, window._heyePreEnd ?? b, "
             "window._heyePostStart ?? c, window._heyePostEnd ?? d, w]"
+        )
+        # 事件库：搜索 → 选一个 → 一键把坐标与时间填进表单
+        event_search_btn.click(
+            search_event_library,
+            inputs=event_q,
+            outputs=[event_pick, search_status],
+        )
+        event_q.submit(
+            search_event_library,
+            inputs=event_q,
+            outputs=[event_pick, search_status],
+        )
+        event_load_btn.click(
+            load_event_template,
+            inputs=event_pick,
+            outputs=[lon_in, lat_in, pre_start, pre_end, post_start, post_end, search_status],
+        )
+        event_pick.change(
+            load_event_template,
+            inputs=event_pick,
+            outputs=[lon_in, lat_in, pre_start, pre_end, post_start, post_end, search_status],
         )
         search_btn.click(
             geocode_place,
@@ -1012,6 +1195,22 @@ def main() -> None:
     print(f"访问地址：http://{args.host}:{args.port}")
     print("=" * 68)
 
+    launch_kw = dict(_launch_kwargs())
+    if args.share:
+        # --share 会把服务发布到公网，且本界面包含上传与本地路径输入参数，
+        # 默认无鉴权等于把这些能力开放给任何人。强制要求账号口令才允许分享。
+        share_user = os.environ.get("HUIYAN_SHARE_USER")
+        share_password = os.environ.get("HUIYAN_SHARE_PASSWORD")
+        if not (share_user and share_password):
+            raise SystemExit(
+                "已拒绝 --share：该选项会把服务发布到公网，而本界面可上传文件、填写本地路径，"
+                "无鉴权开放存在风险。\n"
+                "如确需分享，请先设置环境变量 HUIYAN_SHARE_USER 与 HUIYAN_SHARE_PASSWORD，"
+                "启动时会自动启用用户名/密码保护。"
+            )
+        launch_kw["auth"] = (share_user, share_password)
+        print("[warn] --share 已启用公网分享，并已开启口令保护")
+
     demo = build_ui(baseline_only=args.baseline_only)
     demo.queue().launch(
         server_name=args.host,
@@ -1020,7 +1219,7 @@ def main() -> None:
         show_error=True,
         inbrowser=False,
         quiet=False,
-        **_launch_kwargs(),
+        **launch_kw,
     )
 
 

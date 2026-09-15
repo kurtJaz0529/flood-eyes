@@ -1,13 +1,53 @@
 # -*- coding: utf-8 -*-
-"""申报书降AI率改写：替换AI生成段落，删除聊天残留，输出到D盘"""
+"""申报书降AI率改写：替换AI生成段落，删除聊天残留。
+
+用法：
+    python scripts/rewrite_shenbaoshu.py [源文件.docx]
+    set HUIYAN_SB_SRC=D:\\某处\\申报书.docx
+    set HUIYAN_SB_DST=D:\\输出目录
+"""
+import glob
 import sys, io, os
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import docx
 
-SRC = r"C:\Users\21679\.kimi-code\sessions\wd_system32_bd23f52a41d5\session_185aff38-865c-4a6a-8013-50cddbb33041\attachments\f_7258c43c-b5dd-4cac-9fbd-2d72b31c855c-附件2：《成都理工大学成都理工大学2026年大学生创新训练计划项目（第二批次）申报书》(1).docx"
-DST_DIR = r"D:\大创申报材料"
+
+def _resolve_src() -> str:
+    """定位待改写的申报书。
+
+    原实现把某个 Kimi 会话附件目录下的绝对路径写死，换机器必然
+    FileNotFoundError；这里按 命令行参数 -> 环境变量 -> 常见位置搜索 解析。
+    """
+    explicit = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("HUIYAN_SB_SRC", "")
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise SystemExit(f"找不到申报书文件：{explicit}")
+        return explicit
+    home = os.path.expanduser("~")
+    patterns = [
+        os.path.join(home, ".kimi-code", "sessions", "*", "session_*", "attachments", "*申报书*.docx"),
+        os.path.join(home, "Desktop", "*申报书*.docx"),
+        os.path.join(home, "Downloads", "*申报书*.docx"),
+        os.path.join(home, "Documents", "*申报书*.docx"),
+    ]
+    hits: list = []
+    for pat in patterns:
+        hits.extend(glob.glob(pat))
+    if not hits:
+        raise SystemExit(
+            "找不到申报书 .docx（已搜索桌面/下载/文档 与 Kimi 附件目录）。\n"
+            "请显式指定：python scripts/rewrite_shenbaoshu.py \"D:\\某处\\申报书.docx\"\n"
+            "或设置环境变量 HUIYAN_SB_SRC。"
+        )
+    return sorted(hits, key=os.path.getmtime, reverse=True)[0]
+
+
+SRC = _resolve_src()
+DST_DIR = os.environ.get("HUIYAN_SB_DST") or r"D:\大创申报材料"
 os.makedirs(DST_DIR, exist_ok=True)
 DST = os.path.join(DST_DIR, "附件2-大创项目申报书（慧眼识灾）.docx")
+print(f"源文件：{SRC}")
+print(f"输出到：{DST}")
 
 R = {
 "慧眼识灾是一款基于深度学习的遥感洪水智能识别系统":
@@ -70,18 +110,30 @@ for p in paras:
     else:
         for marker, new in R.items():
             if t.startswith(marker):
+                # 段落可能是"标记 + 后续正文"的拼接。原实现清空所有 run 后只写回
+                # 新文本，标记之后的正文会被静默丢弃，而脚本只打印替换条数、
+                # 不提示内容变短。这里保留标记之后的内容，并对明显缩短给出告警。
+                tail = t[len(marker):]
+                combined = new + tail
                 for r in p.runs:
                     r.text = ""
                 if p.runs:
-                    p.runs[0].text = new
+                    p.runs[0].text = combined
                 else:
-                    p.add_run(new)
-                replaced.append(marker[:18])
+                    p.add_run(combined)
+                if len(combined) < len(t) * 0.8:
+                    print(f"  [warn] 段落明显缩短 {len(t)} -> {len(combined)} 字：{marker[:24]}")
+                replaced.append((marker[:18], len(t), len(combined)))
                 break
 
 doc.save(DST)
 print("已替换段落数：", len(replaced))
-for r in replaced: print("  ✓", r)
+for item in replaced:
+    if isinstance(item, tuple):
+        label, before_len, after_len = item
+        print(f"  ✓ {label}  {before_len} -> {after_len} 字")
+    else:
+        print("  ✓", item)
 print("已删除残留段落：", len(deleted))
 for d in deleted: print("  ✗", d)
 print("saved:", DST)

@@ -88,7 +88,10 @@ def main() -> int:
             log = os.path.join(workdir, "logs", "desktop.log")
             if os.path.isfile(log):
                 print("\n--- desktop.log 末尾 ---")
-                print("\n".join(open(log, encoding="utf-8", errors="replace").read().splitlines()[-15:]))
+                # 用 with 关闭句柄（原实现 open(...).read() 会留一个未关闭的文件对象）
+                with open(log, encoding="utf-8", errors="replace") as fh:
+                    tail = fh.read().splitlines()[-15:]
+                print("\n".join(tail))
             return 1
 
         from gradio_client import Client
@@ -110,9 +113,14 @@ def main() -> int:
                 results.append(check(need <= names, "成果包内容齐全", f"{len(names)} 个文件"))
                 if "stats.json" in names:
                     payload = json.loads(zf.read("stats.json").decode("utf-8"))
-                    results.append(check(payload.get("stats", {}).get("water_area_km2", 0) > 0,
-                                         "stats.json 数值有效",
-                                         f"水体 {payload['stats']['water_area_km2']:.2f} km²"))
+                    # detail 参数会先求值：直接下标取值在缺键时抛 KeyError，
+                    # 验收脚本会崩溃而不是标记该项失败。
+                    area = payload.get("stats", {}).get("water_area_km2")
+                    results.append(check(
+                        area is not None and float(area) > 0,
+                        "stats.json 数值有效",
+                        f"水体 {float(area):.2f} km²" if area is not None else "字段缺失 water_area_km2",
+                    ))
                 if "report.pdf" in names:
                     pdf = zf.read("report.pdf")
                     results.append(check(pdf[:4] == b"%PDF" and len(pdf) > 5000,

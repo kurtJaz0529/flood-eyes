@@ -43,7 +43,10 @@ except Exception:  # pragma: no cover
 from src.paths import bundle_root, logs_dir, user_root, weights_dirs  # noqa: E402
 
 APP_NAME = "慧眼识灾 · 遥感 AI 洪水识别系统"
-APP_VERSION = "0.2.0"
+try:  # 版本号单一来源：src/__init__.py，避免界面显示与安装包名不一致
+    from src import __version__ as APP_VERSION  # noqa: E402
+except Exception:  # pragma: no cover
+    APP_VERSION = "0.3.1"
 
 
 # --------------------------------------------------------------------------
@@ -75,6 +78,11 @@ def setup_logging() -> str:
         fh = open(path, "a", encoding="utf-8", buffering=1)
     except Exception:
         return ""
+    # 进程结束前关闭句柄。_Tee.close 是 no-op（避免 Gradio 把日志文件关掉），
+    # 若不再注册 atexit，这个句柄会一直挂到进程被强杀为止。
+    import atexit
+
+    atexit.register(fh.close)
 
     class _Tee:
         encoding = "utf-8"
@@ -226,18 +234,6 @@ def main() -> int:
         return 0
 
     log_path = setup_logging()
-    port = find_free_port(args.host, args.port)
-    url = f"http://{args.host}:{port}"
-
-    print("=" * 70)
-    print(f"{APP_NAME}  v{APP_VERSION}")
-    print(f"资源目录：{bundle_root()}")
-    print(f"工作目录：{user_root()}")
-    print(f"权重目录：{weights_dirs()}")
-    print(f"访问地址：{url}")
-    if log_path:
-        print(f"运行日志：{log_path}")
-    print("=" * 70)
 
     from app.main import build_ui, _launch_kwargs
     from src.infer import available_weights
@@ -250,16 +246,43 @@ def main() -> int:
         demo.queue(default_concurrency_limit=1)
     except TypeError:
         demo.queue()
-    demo.launch(
-        server_name=args.host,
-        server_port=port,
-        share=False,
-        show_error=True,
-        inbrowser=False,
-        quiet=True,
-        prevent_thread_lock=True,
-        **_launch_kwargs(),
-    )
+
+    # find_free_port 的"探测"与 Gradio 真正 bind 之间存在竞态窗口，
+    # 中间被别的进程抢占时启动会直接失败。这里在失败后换端口重试。
+    port = args.port
+    url = ""
+    last_exc: Optional[Exception] = None
+    for attempt in range(5):
+        port = find_free_port(args.host, args.port + attempt)
+        url = f"http://{args.host}:{port}"
+        try:
+            demo.launch(
+                server_name=args.host,
+                server_port=port,
+                share=False,
+                show_error=True,
+                inbrowser=False,
+                quiet=True,
+                prevent_thread_lock=True,
+                **_launch_kwargs(),
+            )
+            last_exc = None
+            break
+        except OSError as exc:
+            last_exc = exc
+            print(f"[warn] 端口 {port} 启动失败（{exc}），换下一个端口重试")
+
+    if last_exc is not None:
+        raise last_exc
+    print("=" * 70)
+    print(f"{APP_NAME}  v{APP_VERSION}")
+    print(f"资源目录：{bundle_root()}")
+    print(f"工作目录：{user_root()}")
+    print(f"权重目录：{weights_dirs()}")
+    print(f"访问地址：{url}")
+    if log_path:
+        print(f"运行日志：{log_path}")
+    print("=" * 70)
     print(f"✅ 服务已启动：{url}")
 
     stopped = threading.Event()

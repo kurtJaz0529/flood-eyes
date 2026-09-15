@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -75,10 +76,20 @@ def main() -> None:
     args = ap.parse_args()
 
     samples_dirs = [os.path.join(ROOT, "data", "real"), os.path.join(ROOT, "data", "samples")]
+    # --sample 会直接拼进文件名：形如 "../../某处/x" 可越过 data/ 读取本机任意同名影像。
+    # 这里限定为常见样本 id 形态，并在拼好后再次确认仍落在 data/ 之内。
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", args.sample or ""):
+        raise SystemExit(
+            f"非法的样本名：{args.sample!r}\n"
+            "只允许字母、数字、下划线、点和连字符（例如 demo04、zhuozhou2023）"
+        )
+    data_root = os.path.realpath(os.path.join(ROOT, "data"))
     pre_path = post_path = ""
     for d in samples_dirs:
         p1 = os.path.join(d, f"{args.sample}_pre.tif")
         p2 = os.path.join(d, f"{args.sample}_post.tif")
+        if not os.path.realpath(p1).startswith(data_root + os.sep):
+            continue
         if os.path.isfile(p1) and os.path.isfile(p2):
             pre_path, post_path = p1, p2
             break

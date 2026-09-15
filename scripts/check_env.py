@@ -85,8 +85,13 @@ def main() -> int:
         else:
             print("  -> CPU 模式：基线推理秒级可跑；训练建议安装 CUDA 版 torch：")
             print("     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124")
-    except Exception as exc:
+    except ImportError as exc:
         print(f"  [缺失] torch 未安装（{exc}）")
+    except Exception as exc:
+        # 区分"没装"和"装了但初始化失败"：原实现把所有异常都报成"未安装"，
+        # 会误导用户反复重装（实际可能是 CUDA/驱动/环境变量问题）。
+        print(f"  [异常] torch 已安装但初始化失败：{type(exc).__name__}: {exc}")
+        print("         这不是缺包问题，请检查 CUDA/驱动 或 torch 版本与 Python 的匹配")
 
     print("\n[结论]")
     if missing:

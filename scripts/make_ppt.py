@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """生成「慧眼识灾」项目路演 PPT（16:9，13页）"""
+import os
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
@@ -76,11 +80,34 @@ def bullets(s, x, y, w, h, items, size=16, gap=True):
     return tb
 
 def pic(s, path, x, y, w=None, h=None):
+    # 图片缺失时 add_picture 会直接抛异常，整份 PPT 白做；先给出明确提示
+    if not os.path.isfile(path):
+        raise SystemExit(f"缺少配图：{path}\n请先跑对应流程生成图片，或用 --assets 指定资源目录")
     return s.shapes.add_picture(path, x, y, width=w, height=h)
 
-A = "F:/deepseek/flood-eyes/docs/assets"
-O_PY = "F:/deepseek/flood-eyes/outputs/poyang2020_post.tif_20260908_220207"
-O_ZZ = "F:/deepseek/flood-eyes/outputs/zhuozhou2023_post.tif_20260908_220109"
+# 资源与产物路径全部由项目根目录推导（原实现写死 F:/deepseek/... 与
+# C:\Users\<用户名>\Desktop\...，换机器必然失败）。
+A = os.environ.get("HUIYAN_PPT_ASSETS") or os.path.join(ROOT, "docs", "assets")
+_out_env = os.environ.get("HUIYAN_PPT_OUT")
+OUT = _out_env or os.path.join(ROOT, "docs", "慧眼识灾-项目路演PPT.pptx")
+
+
+def _latest_output_dir(prefix: str) -> str:
+    """在 outputs/ 下找最近一次生成的成果目录，避免写死带时间戳的目录名。"""
+    root = os.path.join(ROOT, "outputs")
+    if not os.path.isdir(root):
+        return ""
+    cands = [
+        os.path.join(root, name)
+        for name in os.listdir(root)
+        if name.startswith(prefix) and os.path.isdir(os.path.join(root, name))
+    ]
+    return sorted(cands, key=os.path.getmtime, reverse=True)[0] if cands else ""
+
+
+# 兼容旧变量名：找不到时为空串，取图处会给出明确报错
+O_PY = _latest_output_dir("poyang2020_post.tif")
+O_ZZ = _latest_output_dir("zhuozhou2023_post.tif")
 
 # ---------- 1 封面 ----------
 s = slide()
@@ -270,6 +297,9 @@ text(s, Inches(1), Inches(3.9), Inches(11.3), Inches(0.8),
 text(s, Inches(1), Inches(5.2), Inches(11.3), Inches(0.6),
      [("恳请各位评委老师批评指正", 16, WHITE, False)], align=PP_ALIGN.CENTER)
 
-out = r"C:\Users\21679\Desktop\慧眼识灾-项目路演PPT.pptx"
+out = OUT
+# prs.save 不会自动建目录，目标目录不存在会直接抛异常
+os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
 prs.save(out)
-print("saved:", out, "slides:", len(prs.slides.__iter__.__self__._sldIdLst))
+# 用计数器代替 prs.slides 的私有属性（原写法依赖 python-pptx 内部实现，库升级即失效）
+print("saved:", out, "slides:", len(prs.slides._sldIdLst))

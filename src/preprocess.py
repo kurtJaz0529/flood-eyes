@@ -205,7 +205,9 @@ def _read_plain_image(path: str) -> Tuple[np.ndarray, Any, Any, Optional[np.ndar
 
 
 def _read_npy(path: str) -> Tuple[np.ndarray, Any, Any, Optional[np.ndarray], Dict[str, Any]]:
-    arr = np.load(path)
+    # allow_pickle=False：.npy 允许存放对象数组，反序列化即执行 pickle，
+    # 对用户提供的样本文件等于任意代码执行入口。显式关闭，不依赖 numpy 版本默认值。
+    arr = np.load(path, allow_pickle=False)
     if arr.ndim == 2:
         arr = arr[..., None]
     if arr.shape[0] < arr.shape[-1]:  # 看起来像 (C,H,W)
@@ -374,6 +376,14 @@ def load_scene(
     for name, idx in mapping.items():
         if 0 <= idx < raw.shape[-1]:
             bands[name] = np.ascontiguousarray(raw[..., idx])
+    # 先确认主影像解析出了波段：否则下面 nir 分支里的 next(iter(bands.values()))
+    # 会抛 StopIteration，把真正的错误原因（影像波段无法识别）掩盖掉。
+    if not bands:
+        raise ValueError(
+            f"未能从影像解析出任何可用波段：{os.path.basename(path)}"
+            f"（读到 {raw.shape[-1]} 个通道，波段映射 {mapping}）。"
+            "请检查影像波段数或改用显式的 band_order。"
+        )
     meta["band_order"] = band_order if band_order != "auto" else f"auto({len(mapping)}ch)"
     meta["band_map"] = mapping
     if extra.get("descriptions"):
@@ -396,8 +406,6 @@ def load_scene(
         meta["nir_source"] = os.path.basename(nir_path)
 
     meta["nir_available"] = "nir" in bands
-    if not bands:
-        raise ValueError("未能从影像解析出任何可用波段")
 
     if pixel_size_m is None or float(pixel_size_m) <= 0:
         pixel_size_m = pixel_size_from_transform(transform, crs)
@@ -603,6 +611,7 @@ def reproject_scene_to(src: "Scene", dst_ref: "Scene") -> "Scene":
         raise ValueError("无坐标系，无法重投影对齐")
     shape = dst_ref.shape
     bands: Dict[str, np.ndarray] = {}
+    first = next(iter(src.bands.values()))
     for name, band in src.bands.items():
         bands[name] = reproject_array(
             band,
@@ -614,23 +623,29 @@ def reproject_scene_to(src: "Scene", dst_ref: "Scene") -> "Scene":
             resampling="bilinear",
             dst_nodata=0.0,
         ).astype(np.float32)
-    nodata = None
+
+    # 必须显式产出"重投影后的无效像元掩膜"。
+    # 波段在源覆盖范围外被填成 0.0，而 0 反射率本身是合法值，无法据此区分
+    # "真实暗像元"和"没数据"。若下游只依赖 src.nodata_mask（S2 COG 常常为空），
+    # 这些空白区会以 green=0、nir=0 进入 NDWI=(0-0)/eps=0，在浑浊水体那种
+    # 略为负的全局阈值下被判成水体，产生大片假阳性淹没。
+    src_valid = np.ones(first.shape[:2], dtype=np.float32)
     if src.nodata_mask is not None:
-        nodata = (
-            reproject_array(
-                src.nodata_mask.astype(np.float32),
-                src.transform,
-                src.crs,
-                dst_ref.transform,
-                shape,
-                dst_ref.crs,
-                resampling="nearest",
-                dst_nodata=1.0,
-            )
-            >= 0.5
-        )
+        src_valid = (~np.asarray(src.nodata_mask, dtype=bool)).astype(np.float32)
+    covered = reproject_array(
+        src_valid,
+        src.transform,
+        src.crs,
+        dst_ref.transform,
+        shape,
+        dst_ref.crs,
+        resampling="nearest",
+        dst_nodata=0.0,
+    )
+    nodata = covered < 0.5
     meta = dict(src.meta)
     meta["reprojected_to"] = dst_ref.path or "reference"
+    meta["reproject_nodata_fraction_pct"] = round(100.0 * float(nodata.mean()), 2)
     return Scene(
         bands=bands,
         transform=dst_ref.transform,
@@ -656,7 +671,10 @@ def percentile_stretch(arr: np.ndarray, low: float = 2.0, high: float = 98.0) ->
     lo, hi = np.percentile(finite, [low, high])
     if hi - lo < 1e-6:
         lo, hi = float(finite.min()), float(finite.max()) + 1e-6
-    out = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    # 先把 NaN/Inf 归到 lo：astype(uint8) 对非有限值的转换属未定义行为
+    # （新版本 numpy 会发 RuntimeWarning 并落到 0），无效像元会变成纯黑点。
+    clean = np.where(np.isfinite(arr), arr, lo)
+    out = np.clip((clean - lo) / (hi - lo), 0.0, 1.0)
     return (out * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -688,6 +706,14 @@ def iter_tiles(
     重叠区在拼接时取平均，避免块与块之间的硬接缝。
     """
     h, w = arr.shape[:2]
+    tile = int(tile)
+    overlap = int(overlap)
+    if tile <= 0:
+        raise ValueError(f"tile 必须为正整数，收到 {tile}")
+    if not 0 <= overlap < tile:
+        # overlap >= tile 时 stride 退化成 1，切片数按 O(H*W) 爆炸
+        # （512×512 影像会产出几十万块），内存和耗时都不可控。
+        raise ValueError(f"overlap 必须满足 0 <= overlap < tile，收到 overlap={overlap}, tile={tile}")
     stride = max(1, tile - overlap)
     ys = list(range(0, max(1, h - tile + 1), stride)) or [0]
     xs = list(range(0, max(1, w - tile + 1), stride)) or [0]
@@ -725,6 +751,10 @@ def pad_to_tile(arr: np.ndarray, tile: int, mode: str = "reflect") -> Tuple[np.n
     pw = (tile - w % tile) % tile
     if ph == 0 and pw == 0:
         return arr, (h, w)
+    # reflect 模式在任一维长度为 1 时 numpy 会直接报错；
+    # 单行/单列影像（或裁剪到 1 像素）退化为 edge 复制。
+    if mode == "reflect" and (h == 1 or w == 1):
+        mode = "edge"
     pad_width = [(0, ph), (0, pw)] + [(0, 0)] * (arr.ndim - 2)
     return np.pad(arr, pad_width, mode=mode), (h, w)
 

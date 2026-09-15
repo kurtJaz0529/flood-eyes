@@ -1,4 +1,4 @@
-# 慧眼识灾 · 一键打包脚本（Windows）
+﻿# 慧眼识灾 · 一键打包脚本（Windows）
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile lite      # 精简版（无 torch，~350MB）
 #   powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile full      # 完整版（含 U-Net，~900MB）
@@ -21,7 +21,11 @@ Write-Host "`n[1/4] 检查 PyInstaller" -ForegroundColor Cyan
 python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "未安装 PyInstaller，正在安装..." -ForegroundColor Yellow
-    python -m pip install pyinstaller pyinstaller-hooks-contrib -i https://pypi.tuna.tsinghua.edu.cn/simple
+    # 走官方 PyPI 并锁定版本：第三方镜像 + 不锁版本的组合，
+    # 一旦镜像被投毒就会直接污染最终分发包（PyInstaller 会注入引导代码）。
+    $pin = if ($env:PYINSTALLER_VERSION) { $env:PYINSTALLER_VERSION } else { "6.11.1" }
+    python -m pip install "pyinstaller==$pin" "pyinstaller-hooks-contrib>=2024.10" --index-url https://pypi.org/simple
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller 安装失败，请手动执行：python -m pip install pyinstaller==$pin" }
 }
 
 Write-Host "`n[2/4] 生成应用图标（如缺失）" -ForegroundColor Cyan
@@ -43,7 +47,7 @@ foreach ($sub in @("outputs", "logs")) {
 
 # 写一份使用说明到产物目录
 $readme = @"
-慧眼识灾 · 遥感 AI 洪水识别系统  v0.2.0
+慧眼识灾 · 遥感 AI 洪水识别系统  v0.3.1
 ========================================
 
 【怎么用】
@@ -80,7 +84,7 @@ $readme = @"
 Set-Content -Path (Join-Path $dist "使用说明.txt") -Value $readme -Encoding UTF8
 
 Write-Host "`n[4/4] 打包 ZIP" -ForegroundColor Cyan
-$version = "0.2.0"
+$version = "0.3.1"
 $zipName = "慧眼识灾_v${version}_$Profile.zip"
 $zipPath = Join-Path (Get-Location) (Join-Path $distPath $zipName)
 if (-not $NoZip) {

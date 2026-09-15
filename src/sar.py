@@ -46,6 +46,44 @@ DEFAULT_WATER_DB = {"VV": -16.0, "VH": -19.0}
 # 仅作兜底：河南/华北。正常路径按 GCP 经纬度选带。
 DEFAULT_UTM = "EPSG:32649"
 
+_VALID_POL = ("VV", "VH", "HH", "HV")
+_SID_UNSAFE = re.compile(r"[^0-9A-Za-z_.-]")
+
+
+def normalize_polarization(value: str) -> str:
+    """极化方式白名单校验（返回大写）。
+
+    polarization 会拼进 glob 模式（calibration/measurement 文件名）和输出文件名，
+    未校验时 "V*"、"/"、".." 之类会匹配到非预期文件，或让输出文件逃出目标目录。
+    """
+    pol = str(value or "").strip().upper()
+    if pol not in _VALID_POL:
+        raise ValueError(f"不支持的极化方式 {value!r}，可选：{list(_VALID_POL)}")
+    return pol
+
+
+def safe_sid(value: Optional[str], fallback: str = "sar_sample") -> str:
+    """把外部标识清洗成安全的文件名片段（防路径穿越）。
+
+    sample_id 可能来自界面输入或命令行；未清洗时 "..\\..\\x" 之类可让落盘文件
+    写到 out_dir 之外，且 save_db_geotiff/_save_rgb 会自动建目录，破坏范围会扩大。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return fallback
+    cleaned = _SID_UNSAFE.sub("_", raw).strip("._-")
+    return cleaned[:64] or fallback
+
+
+def _assert_within(out_dir: str, path: str) -> str:
+    """确认输出路径规范化后仍位于 out_dir 内，否则拒绝（纵深防御）。"""
+    base = os.path.realpath(out_dir)
+    real = os.path.realpath(path)
+    if real != base and not real.startswith(base + os.sep):
+        raise ValueError(f"输出路径越界，已拒绝写入：{path}")
+    return path
+
+
 
 def utm_epsg_from_lonlat(lon: float, lat: float) -> str:
     """由经纬度选 UTM 带（尼泊尔 45N、河南 49N）。"""
@@ -97,7 +135,7 @@ class CalibrationLUT:
 
 def calibration_xml_candidates(safe_dir: str, polarization: str = "vv") -> List[str]:
     """标定 XML，排除同目录下的 noise-*.xml。"""
-    pol = polarization.lower()
+    pol = normalize_polarization(polarization).lower()
     for sub in ("annotation/calibration", "annotation", ""):
         folder = os.path.join(safe_dir, *sub.split("/")) if sub else safe_dir
         hits = sorted(glob.glob(os.path.join(folder, f"calibration-*{pol}*.xml")))
@@ -186,7 +224,7 @@ def find_safe_dir(path: str) -> str:
 
 
 def find_measurement(safe_dir: str, polarization: str = "vv") -> str:
-    pol = polarization.lower()
+    pol = normalize_polarization(polarization).lower()
     cands = glob.glob(os.path.join(safe_dir, "measurement", f"*{pol}*.tiff")) or \
             glob.glob(os.path.join(safe_dir, "measurement", f"*{pol}*.tif"))
     if not cands:
@@ -207,6 +245,10 @@ def fit_gcp_affine(tif_path: str, dst_crs: Optional[str] = None) -> GcpAffine:
         gcps, gcp_crs = src.gcps
     if not gcps:
         raise ValueError(f"{tif_path} 没有 GCP，无法定位")
+    if len(gcps) < 3:
+        # 少于 3 个 GCP 时最小二乘是秩亏的，解出的仿射矩阵会把窗口定位到
+        # nan 或完全错误的位置，且 residual 无意义——直接拒绝，不要静默出图。
+        raise ValueError(f"{tif_path} 只有 {len(gcps)} 个 GCP，不足以拟合仿射变换（至少需要 3 个）")
 
     rows = np.array([g.row for g in gcps], dtype=np.float64)
     cols = np.array([g.col for g in gcps], dtype=np.float64)
@@ -655,7 +697,10 @@ def process_sar_pair(
         if progress:
             progress(msg)
 
-    pol = polarization.upper()
+    pol = normalize_polarization(polarization)
+    size = int(size)
+    if size <= 0:
+        raise ValueError(f"窗口边长 size 必须为正整数，收到 {size}")
     thr = threshold_db if threshold_db is not None else DEFAULT_WATER_DB.get(pol, -16.0)
 
     say(f"加载灾前景：{os.path.basename(os.path.abspath(pre_path))}")
@@ -705,10 +750,20 @@ def process_sar_pair(
             resampling="bilinear", dst_nodata=-35.0,
         )
         post_tf = pre_tf
+        # 重投影会在灾后覆盖范围之外填 -35 dB 哨兵值。这个值远低于水体阈值，
+        # 若不掩膜，会被 detect_water_sar 判成"水"，使 post_water_km2 虚高，
+        # 并让持续水体/退水面积失真。用显式有效掩膜把这些像元排除在统计之外。
+        post_valid = post_db > -34.0
+    else:
+        post_valid = np.ones(post_db.shape, dtype=bool)
 
     # 提取
     say("水体提取 + 变化检测...")
     chg = sar_change(pre_db, post_db, pol, thr, drop_db, speckle=3, min_area_px=min_area_px)
+    if not post_valid.all():
+        # 无效像元一律不算水体，也不参与新增/退水/持续判定
+        for key in ("post_mask", "new", "receded", "persistent"):
+            chg[key] = np.asarray(chg[key], dtype=bool) & post_valid
     px = pixel_size_m_from_affine(pre_tf)
     stats = {
         "pre_water_km2": area_km2(chg["pre_mask"], px),
@@ -724,12 +779,13 @@ def process_sar_pair(
 
     # 落盘
     os.makedirs(out_dir, exist_ok=True)
-    sid = sample_id or (f"henan_{post.datetime[:8]}" if post.datetime else "sar_sample")
+    # sid 来自界面/命令行，必须清洗后再拼文件名，否则 "..\..\x" 可让成果写出 out_dir
+    sid = safe_sid(sample_id, f"henan_{post.datetime[:8]}" if post.datetime else "sar_sample")
     from .postprocess import change_map_rgb, overlay_mask
 
-    pre_tif = save_db_geotiff(os.path.join(out_dir, f"{sid}_pre_{pol.lower()}.tif"), pre_db,
+    pre_tif = save_db_geotiff(_assert_within(out_dir, os.path.join(out_dir, f"{sid}_pre_{pol.lower()}.tif")), pre_db,
                               pre_tf, pre.affine.crs)
-    post_tif = save_db_geotiff(os.path.join(out_dir, f"{sid}_post_{pol.lower()}.tif"), post_db,
+    post_tif = save_db_geotiff(_assert_within(out_dir, os.path.join(out_dir, f"{sid}_post_{pol.lower()}.tif")), post_db,
                                post_tf, pre.affine.crs)
 
     pre_gray = np.stack([db_to_gray(pre_db)] * 3, axis=-1)
@@ -789,7 +845,13 @@ def _make_preview(path: str, panels: List[str], captions: List[str], max_width: 
             except Exception:
                 font = None
 
-    imgs = [Image.open(p).convert("RGB") for p in panels]
+    # Image.open 是惰性的：不显式读取并关闭，Windows 上会一直占着文件句柄，
+    # 导致后续删除/覆盖输出目录失败。
+    imgs = []
+    for p in panels:
+        with Image.open(p) as im:
+            im.load()
+            imgs.append(im.convert("RGB"))
     h = max(i.height for i in imgs)
     imgs = [i if i.height == h else i.resize((int(i.width * h / i.height), h)) for i in imgs]
     gap, bar = 8, 34

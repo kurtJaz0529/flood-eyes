@@ -40,11 +40,14 @@ except Exception:  # pragma: no cover
     pass
 
 from src.sar import (  # noqa: E402
+    _assert_within,
     _make_preview,
     _save_rgb,
     area_km2,
     db_to_gray,
     detect_water_sar,
+    normalize_polarization,
+    safe_sid,
     sar_change,
     save_db_geotiff,
 )
@@ -101,8 +104,13 @@ class WindowNotCovered(RuntimeError):
 
 
 def read_rtc_window(href: str, token: str, lon: float, lat: float, size_px: int,
-                    retries: int = 3) -> Tuple[np.ndarray, Any, str]:
-    """读 RTC 窗口（10m），返回 (线性 σ0 数组, transform, crs)。"""
+                    retries: int = 3) -> Tuple[np.ndarray, Any, str, np.ndarray]:
+    """读 RTC 窗口（10m），返回 (线性 σ0 数组, transform, crs, 有效像元掩膜)。
+
+    第 4 个返回值标记真实读到的像元。补边区必须由调用方排除：
+    该数组是线性 σ0，补边用的 0 换算成 dB 约 -60 dB，远低于水体阈值，
+    若不加掩膜会被判成"水"，让窗口边缘出现大片假淹没、面积统计虚高。
+    """
     import rasterio
     from rasterio.windows import from_bounds
     from rasterio.warp import transform as warp_transform
@@ -118,17 +126,21 @@ def read_rtc_window(href: str, token: str, lon: float, lat: float, size_px: int,
                     half = size_px * 5.0  # 10 m 像元 -> 米
                     win = from_bounds(xs[0] - half, ys[0] - half, xs[0] + half, ys[0] + half, src.transform)
                     arr = src.read(1, window=win).astype(np.float32)
+                    valid = np.isfinite(arr) & (arr > 0)
                     if arr.shape != (size_px, size_px):
                         h, w = arr.shape
                         if h < size_px * 0.7 or w < size_px * 0.7:
                             raise WindowNotCovered(f"窗口尺寸 {arr.shape}，该切片不覆盖 AOI")
+                        kh, kw = min(h, size_px), min(w, size_px)
                         pad = np.zeros((size_px, size_px), dtype=np.float32)
-                        pad[: min(h, size_px), : min(w, size_px)] = arr[: min(h, size_px), : min(w, size_px)]
-                        arr = pad
-                    finite = arr[np.isfinite(arr)]
+                        pad_valid = np.zeros((size_px, size_px), dtype=bool)
+                        pad[:kh, :kw] = arr[:kh, :kw]
+                        pad_valid[:kh, :kw] = valid[:kh, :kw]
+                        arr, valid = pad, pad_valid
+                    finite = arr[valid]
                     if finite.size == 0 or float(np.median(np.maximum(finite, 0))) <= 0:
                         raise WindowNotCovered("窗口无有效值（可能不覆盖 AOI）")
-                    return arr, src.window_transform(win), str(src.crs)
+                    return arr, src.window_transform(win), str(src.crs), valid
         except WindowNotCovered:
             raise
         except Exception as exc:
@@ -168,7 +180,10 @@ def run_rtc_flood(
     token = get_sas_token()
     say("已获取 SAS token（有效期约 1 小时）")
     size = int(size)
-    pol = pol.upper()
+    if not 64 <= size <= 4096:
+        # size 直接来自命令行/界面；过大（如 100000）会申请数十 GB 级数组把内存打爆。
+        raise ValueError(f"窗口边长 size 需在 64~4096 之间，收到 {size}")
+    pol = normalize_polarization(pol)
     asset = "vv" if pol == "VV" else "vh"
 
     def _try_read(tag: str, date: str):
@@ -177,24 +192,30 @@ def run_rtc_flood(
             if not href:
                 continue
             try:
-                arr, tr, crs_ = read_rtc_window(href, token, lon, lat, size)
+                arr, tr, crs_, valid = read_rtc_window(href, token, lon, lat, size)
                 say(f"{tag}景选定：{it['id']}  {it['properties']['datetime'][:16]}  CRS={crs_}")
-                return it, arr, tr, crs_
+                return it, arr, tr, crs_, valid
             except Exception as exc:
                 say(f"  {tag}候选 {it['id'][:46]}… 不可用（{type(exc).__name__}），试下一个")
         raise RuntimeError(f"{tag}景：所有候选切片都读不到（可能该区域不在 RTC 覆盖内）")
 
-    pre_item, pre_lin, transform, crs = _try_read("灾前", before)
-    post_item, post_lin, transform2, _ = _try_read("灾后", after)
+    pre_item, pre_lin, transform, crs, pre_valid = _try_read("灾前", before)
+    post_item, post_lin, transform2, _, post_valid = _try_read("灾后", after)
     say(f"{pol} 读取完成 {pre_lin.shape}")
 
     pre_db = 10.0 * np.log10(np.maximum(pre_lin, 1e-6))
     post_db = 10.0 * np.log10(np.maximum(post_lin, 1e-6))
-    say(f"灾前 dB 中位 {float(np.median(pre_db)):.1f} | 灾后 {float(np.median(post_db)):.1f}")
 
     pre_m, _, _pre_meta = detect_water_sar(pre_db, pol, threshold_db, "fixed", 3, 100)
     post_m, _, _post_meta = detect_water_sar(post_db, pol, threshold_db, "fixed", 3, 100)
     chg = sar_change(pre_db, post_db, pol, threshold_db, drop_db, 3, 100)
+    # 补边/无效像元一律不算水体，也不参与新增/退水/持续判定：
+    # 它们的 dB 值（约 -60）天然低于阈值，不掩膜会被整体计入淹水面。
+    pre_m = np.asarray(pre_m, dtype=bool) & pre_valid
+    post_m = np.asarray(post_m, dtype=bool) & post_valid
+    both_valid = pre_valid & post_valid
+    for key in ("new", "receded", "persistent"):
+        chg[key] = np.asarray(chg[key], dtype=bool) & both_valid
     px = 10.0
     stats = {
         "pre_water_km2": area_km2(pre_m, px),
@@ -210,9 +231,11 @@ def run_rtc_flood(
         f"（新增 {stats['new_water_km2']:.2f} km²）")
 
     os.makedirs(out_dir, exist_ok=True)
-    sid = sid or f"rtc_{after.replace('-', '')}"
-    pre_tif = save_db_geotiff(os.path.join(out_dir, f"{sid}_pre_{pol.lower()}.tif"), pre_db, transform, crs)
-    post_tif = save_db_geotiff(os.path.join(out_dir, f"{sid}_post_{pol.lower()}.tif"), post_db, transform2, crs)
+    # sid 可能来自命令行 --id，必须清洗后再拼文件名，否则 "..\..\x" 可把成果
+    # 写到 out_dir 之外（save_db_geotiff/_save_rgb 会自动建目录，破坏范围更大）。
+    sid = safe_sid(sid, f"rtc_{after.replace('-', '')}")
+    pre_tif = save_db_geotiff(_assert_within(out_dir, os.path.join(out_dir, f"{sid}_pre_{pol.lower()}.tif")), pre_db, transform, crs)
+    post_tif = save_db_geotiff(_assert_within(out_dir, os.path.join(out_dir, f"{sid}_post_{pol.lower()}.tif")), post_db, transform2, crs)
 
     from src.postprocess import change_map_rgb, overlay_mask
 
@@ -250,7 +273,7 @@ def run_rtc_flood(
         "stats": stats,
         "provenance": provenance,
     }
-    mpath = os.path.join(out_dir, "samples.json")
+    mpath = _assert_within(out_dir, os.path.join(out_dir, "samples.json"))
     samples = []
     if os.path.isfile(mpath):
         try:
@@ -259,9 +282,17 @@ def run_rtc_flood(
         except Exception:
             samples = []
     samples = [s for s in samples if s.get("id") != sid] + [manifest]
-    with open(mpath, "w", encoding="utf-8") as fh:
-        json.dump({"note": "Sentinel-1 RTC 处理成果（σ0 dB）", "samples": samples}, fh,
-                  ensure_ascii=False, indent=2)
+    # 原子替换：直接覆写若中途崩溃/断电会留下截断 JSON，下次加载只能清空整个清单。
+    # 先写同目录临时文件再 os.replace；路径边界由 _assert_within 兜住。
+    from pathlib import Path
+
+    tmp_file = Path(_assert_within(out_dir, mpath + ".tmp"))
+    tmp_file.write_text(
+        json.dumps({"note": "Sentinel-1 RTC 处理成果（σ0 dB）", "samples": samples},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(str(tmp_file), mpath)
 
     say(f"✓ 成果写入 {out_dir}")
     return {

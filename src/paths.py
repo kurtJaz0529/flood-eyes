@@ -38,11 +38,14 @@ def user_root() -> str:
     if not is_frozen():
         return bundle_root()
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    # 用系统生成的唯一临时文件探测可写性。
+    # 原实现固定写 exe_dir/.write_test：多实例并发时一个实例会删掉另一个刚建的
+    # 文件导致误判"不可写"；若目录里本来就有同名文件，还会被直接截断并删除。
     try:
-        probe = os.path.join(exe_dir, ".write_test")
-        with open(probe, "w", encoding="utf-8") as fh:
-            fh.write("ok")
-        os.remove(probe)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(dir=exe_dir, prefix=".huiyan_write_", delete=True) as fh:
+            fh.write(b"ok")
         return exe_dir
     except Exception:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")

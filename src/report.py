@@ -234,6 +234,31 @@ def export_bundle(
         metrics = [
             ("数据源", str(result.meta.get("source", "-"))),
             ("识别模型", str(result.meta.get("model_label", "-"))),
+        ]
+        # 影像溯源：应急研判需要能追到"用的哪几景、什么时候、云量多少"。
+        # 原实现只导出统计量，拿到成果包无法回溯原始影像。
+        prov = result.meta.get("provenance")
+        if isinstance(prov, dict) and prov:
+            for tag, name in (("pre", "灾前影像"), ("post", "灾后影像")):
+                scene = prov.get(f"{tag}_scene")
+                if scene:
+                    when = str(prov.get(f"{tag}_datetime", ""))[:10]
+                    metrics.append((name, f"{scene}　{when}".strip()))
+            clouds = []
+            for tag, name in (("pre", "灾前"), ("post", "灾后")):
+                value = prov.get(f"{tag}_window_cloud_pct")
+                if value is not None:
+                    clouds.append(f"{name} {value}%")
+            if clouds:
+                metrics.append(("窗口云量", "　".join(clouds)))
+            if prov.get("source"):
+                metrics.append(("影像来源", str(prov["source"])))
+
+        matched = result.meta.get("matched_event")
+        if isinstance(matched, dict) and matched.get("label"):
+            metrics.append(("匹配事件", str(matched["label"])))
+
+        metrics += [
             ("水体面积", f"{result.stats.get('water_area_km2', 0):,.3f} km²"),
             ("占影像比例", f"{result.stats.get('water_fraction_pct', 0):.2f}%"),
             ("连通水域个数", f"{result.stats.get('n_components', 0)}"),

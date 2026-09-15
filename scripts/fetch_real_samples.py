@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -66,26 +67,132 @@ _BAND_KEYS = {
     "earthsearch": {"blue": "blue", "green": "green", "red": "red", "nir": "nir", "scl": "scl"},
     "pc": {"blue": "B02", "green": "B03", "red": "B04", "nir": "B08", "scl": "SCL"},
 }
-_SIGN_CACHE: Dict[str, str] = {}
+_SIGN_CACHE: Dict[str, Tuple[str, float]] = {}
+_SIGN_TTL_S = 3000.0  # PC 的 SAS token 约 1 小时有效，留余量提前重签
+_SIGN_LOCK = threading.Lock()
+
+# 允许发起请求的资产主机白名单。STAC 响应里的 href 会被交给 GDAL/rasterio
+# 直接发起请求，若检索结果被污染或走了恶意代理，本机可能被诱导访问内网。
+_ALLOWED_ASSET_HOSTS = (
+    "sentinel-s2-l2a.s3.amazonaws.com",
+    "sentinel-cogs.s3.us-west-2.amazonaws.com",
+    "earth-search.aws.element84.com",
+    "planetarycomputer.microsoft.com",
+)
+
+# 按后缀放行的域名。Planetary Computer 的 COG 资产放在 Azure Blob 上，
+# 主机名带账号前缀且会变（sentinel2l2a01 / sentinel1euwestrtc01 / ai4edataeuwest …），
+# 用精确匹配会把整个 PC 数据源拦死——必须按域后缀放行。
+_ALLOWED_ASSET_HOST_SUFFIXES = (
+    ".blob.core.windows.net",
+)
 
 
 def _catalog_of(item: Dict[str, Any]) -> str:
     return str(item.get("_catalog") or "earthsearch")
 
 
+class AssetRejected(ValueError):
+    """资产地址被协议/主机/IP 校验拒绝。
+
+    刻意继承 ValueError（调用方既有的 except ValueError 仍能捕获），
+    同时让重试逻辑能区分"确定性失败"与"网络抖动"。
+    """
+
+
+def _host_allowed(host: str) -> bool:
+    """主机是否在允许的来源内（精确名单 + 受控域后缀）。
+
+    单独抽成纯函数，便于离线验证白名单本身是否正确。
+    """
+    h = (host or "").lower()
+    if not h:
+        return False
+    if h in _ALLOWED_ASSET_HOSTS:
+        return True
+    return any(h.endswith(suffix) for suffix in _ALLOWED_ASSET_HOST_SUFFIXES)
+
+
+def _is_private_ip(ip_text: str) -> bool:
+    """解析出的 IP 是否属于内网/环回/链路本地/保留段。"""
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return True  # 解析不出的一律视为不可信
+    return bool(
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def _assert_public_https_url(raw_url: str) -> str:
+    """发请求前的统一校验：协议 + 主机白名单 + 解析后 IP 不得指向内网。
+
+    失败抛 `AssetRejected`（ValueError 子类）：这类失败是确定性的，
+    调用方不应重试——重试只会白等几秒并刷日志。
+    """
+    parsed = urllib.parse.urlparse(str(raw_url))
+    if parsed.scheme != "https":
+        raise AssetRejected(f"拒绝非 https 地址：{str(raw_url)[:100]}")
+    host = (parsed.hostname or "").lower()
+    if not _host_allowed(host):
+        raise AssetRejected(f"拒绝白名单之外的资产主机：{host or '(空主机)'}")
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        raise AssetRejected(f"资产主机无法解析：{host}") from exc
+    for info in infos:
+        addr = info[4][0]
+        if _is_private_ip(addr):
+            # 防 DNS rebinding / 被劫持的 DNS 把请求引向内网或云元数据地址
+            raise AssetRejected(f"资产主机 {host} 解析到非公网地址 {addr}，已拒绝")
+    return str(raw_url)
+
+
+def write_json_atomic(path: str, payload: Any) -> str:
+    """原子写入 JSON：先写同目录临时文件，再 os.replace 改名。
+
+    直接覆写时若中途崩溃/断电，会留下截断的 JSON；下次加载解析失败只能在
+    警告后按空清单处理，等于把之前抓好的样本记录整批丢掉。
+    """
+    from pathlib import Path
+
+    tmp = str(path) + ".tmp"
+    Path(tmp).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, str(path))
+    return str(path)
+
+
 def _sign_pc(href: str) -> str:
-    """用 PC 公开签名接口换带 SAS token 的资产 URL（缓存，1 小时内复用）。"""
-    if href in _SIGN_CACHE:
-        return _SIGN_CACHE[href]
-    url = PC_SIGN_API + "?" + urllib.parse.urlencode({"href": href})
+    """用 PC 公开签名接口换带 SAS token 的资产 URL（带 TTL 缓存）。
+
+    两处加固：
+    · href 来自 STAC 响应属外部输入，先过协议/主机/IP 校验再进请求；
+    · 缓存带过期时间——token 失效后读取会持续 403，而"永不过期"的缓存
+      会让程序再也无法自愈（原实现注释写了 1 小时复用，代码却永不清除）。
+    """
+    now = time.time()
+    with _SIGN_LOCK:
+        hit = _SIGN_CACHE.get(href)
+        if hit and hit[1] > now:
+            return hit[0]
+    href = _assert_public_https_url(href)
+    url = _assert_public_https_url(PC_SIGN_API + "?" + urllib.parse.urlencode({"href": href}))
     last: Optional[Exception] = None
     for i in range(3):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=20) as resp:
-                signed = str(json.load(resp)["href"])
-            _SIGN_CACHE[href] = signed
+                signed = _assert_public_https_url(str(json.load(resp)["href"]))
+            with _SIGN_LOCK:
+                _SIGN_CACHE[href] = (signed, time.time() + _SIGN_TTL_S)
             return signed
+        except ValueError:
+            raise
         except Exception as exc:  # noqa: BLE001
             last = exc
             time.sleep(1.5 * (i + 1))
@@ -260,13 +367,22 @@ def _with_retry(fn, attempts: int = 3, base_delay: float = 2.0, label: str = "")
     for i in range(attempts):
         try:
             return fn()
+        except AssetRejected:
+            # 协议/主机/IP 校验拒绝是确定性失败，重试不会改变结果。
+            # 不在这里放行的话，每个被拒的候选景都要白等 2+4 秒并刷日志。
+            raise
+        except TimeoutError:
+            # deadline 到点是调用方的硬约束，不能被当成"网络抖动"再等一轮
+            raise
         except Exception as exc:  # noqa: BLE001
             last = exc
             if i < attempts - 1:
                 wait = base_delay * (i + 1)
                 print(f"    [retry] {label} 读取失败({type(exc).__name__})，{wait:.0f} 秒后重试")
                 time.sleep(wait)
-    assert last is not None
+    if last is None:
+        # 原实现用 assert 做不可达假设，python -O 下被剥离后会抛 TypeError 掩盖真因
+        raise RuntimeError(f"{label or '读取'} 未执行成功且未记录异常")
     raise last
 
 
@@ -561,15 +677,25 @@ def _pick_scene_stac(
     """
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for item in candidates:
-        if not point_in_bbox(item["bbox"], lon, lat):
+        # STAC 条目允许缺 bbox / datetime / 云量，缺字段时应淘汰该景，
+        # 而不是让 KeyError/TypeError 中断整轮候选遍历。
+        bbox_item = item.get("bbox")
+        if not bbox_item:
+            continue
+        if not point_in_bbox(bbox_item, lon, lat):
             continue
         if not _covers_aoi(item, lon, lat):
             continue
         props = item.get("properties") or {}
-        date = str(props.get("datetime", ""))[:10]
+        date = str(props.get("datetime") or "")[:10]
         if len(date) < 10:
             continue
-        cloud = float(props.get("eo:cloud_cover", 100.0))
+        try:
+            np.datetime64(date)
+        except (ValueError, TypeError):
+            print(f"    [skip] {item.get('id', '?')}: 日期字段非法（{date!r}）")
+            continue
+        cloud = float(props.get("eo:cloud_cover") or 100.0)
         dt_days = abs((np.datetime64(date) - np.datetime64(target_date)) / np.timedelta64(1, "D"))
         scored.append((cloud + 1.5 * float(dt_days), item))
     if not scored:
@@ -592,8 +718,11 @@ def _pick_scene_stac(
         quality = {"cloud_pct": cloud, "water_pct": 0.0, "valid_pct": 100.0}
         try:
             quality = scene_window_quality(item, center[0], center[1], half_km=half_km)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 质检失败不能沿用 valid_pct=100 的默认值：那等于把"没测出来"当成
+            # "满分景"，随后的云量判断建立在伪造数据上，可能把重云景当成首选。
+            print(f"    [skip] {item['id']}: 窗口质检失败 {type(exc).__name__}，淘汰该景")
+            continue
         verified.append((score, item, quality, center))
         print(f"    {date}  {item['id']:34s} 景云量 {cloud:5.1f}%  窗口云量 {quality['cloud_pct']:5.1f}%  "
               f"挪窗 {center[2]:4.1f}km  评分 {score:6.1f}")
@@ -729,8 +858,13 @@ def _fetch_scene_at(
             if band == "blue":
                 valid_frac = float(np.count_nonzero(raw) / max(raw.size, 1))
             refl = reflectance_from_dn(raw, scale, offset, offset_applied)
-            # 落盘为"反射率 ×10000"的干净产品，供 preprocess.to_reflectance 直接除 10000
-            bands[band] = np.clip(refl * 10000.0, 1, 10000).astype(np.uint16)
+            # 落盘为"反射率 ×10000"的干净产品，供 preprocess.to_reflectance 直接除 10000。
+            # 必须保留 nodata=0：把 0 一起 clip 到下限 1，会让无效像元变成
+            # 1e-4 反射率的"有效暗像元"，与 profile 里声明的 nodata=0 自相矛盾，
+            # 条带边缘的大片 nodata 会以极暗地物身份混进水体判定。
+            scaled = np.clip(refl * 10000.0, 1, 10000)
+            scaled[raw == 0] = 0.0
+            bands[band] = scaled.astype(np.uint16)
             transform = wtransform
             neg = 100.0 * float((refl < 0).mean())
             print(f"    {band:6s} scale={scale:g} offset={offset:+.3f}  "
@@ -947,6 +1081,9 @@ def _fetch_tag(
         print(f"[{tag}] {CATALOG_LABEL.get(cat, cat)} 检索 {start} ~ {end}（目标 {target}）")
         try:
             items = stac_search(bbox, f"{start}T00:00:00Z/{end}T23:59:59Z", catalog=cat)
+        except TimeoutError:
+            # 预算到点必须整体上抛，不能当成"这个源不行"换下一个继续联网
+            raise
         except Exception as exc:
             last_exc = exc
             print(f"  ✗ 检索失败 {type(exc).__name__}: {exc}")
@@ -975,6 +1112,8 @@ def _fetch_tag(
             t0 = time.time()
             try:
                 data = fetch_scene(item, center[0], center[1], size, os.path.join(out_dir, entry[tag]))
+            except TimeoutError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 print(f"  ✗ {item['id']} 失败 {type(exc).__name__}: {str(exc)[:120]}，换下一景")
@@ -1035,8 +1174,7 @@ def main() -> None:
             print(f"✗ {k} 抓取失败")
             continue
         manifest["samples"] = [s for s in manifest["samples"] if s.get("id") != k] + [entry]
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        write_json_atomic(manifest_path, manifest)
         print(f"✓ {k} 已写入 {manifest_path}")
 
     print("\n全部完成。产物目录：", args.out)

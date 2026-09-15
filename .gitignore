@@ -29,7 +29,6 @@ logs/_unit_test_*
 # ---- 打包产物（体积大，用 Release/网盘分发）----
 dist/
 dist_full/
-dist_installer/
 build/flood_eyes/
 build/*.toc
 build/*.pkg

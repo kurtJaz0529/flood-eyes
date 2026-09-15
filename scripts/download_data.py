@@ -106,12 +106,17 @@ def _check(key: str) -> bool:
     ok = True
     for rel in d["check"]:  # type: ignore[arg-type]
         path = os.path.join(ROOT, rel)
-        exists = os.path.isdir(path) and any(os.scandir(path))
+        # 用 with 管理 ScandirIterator：原实现 any(os.scandir(path)) 会泄漏目录句柄，
+        # 且随后又对同一目录重复 scandir。
+        names: List[str] = []
+        if os.path.isdir(path):
+            with os.scandir(path) as it:
+                names = [e.name for e in it if e.is_file()]
+        exists = bool(names)
         print(f"  [{'✓' if exists else '✗'}] {rel}")
         if exists:
-            files = [f.name for f in os.scandir(path) if f.is_file()]
-            tifs = [f for f in files if f.endswith((".tif", ".tiff"))]
-            masks = [f for f in files if f.endswith((".png", ".tif")) and "mask" in f.lower()]
+            tifs = [f for f in names if f.endswith((".tif", ".tiff"))]
+            masks = [f for f in names if f.endswith((".png", ".tif")) and "mask" in f.lower()]
             print(f"        影像 {len(tifs)} 个，掩膜 {len(masks)} 个")
         ok = ok and exists
     return ok

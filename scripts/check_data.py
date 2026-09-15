@@ -26,6 +26,24 @@ from typing import Any, Dict, List, Optional, Tuple
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+
+def shell_safe_path(path: str) -> str:
+    """把路径放进"可复制命令"提示里前先净化。
+
+    这些提示是让用户直接复制粘贴执行的；若路径含引号、反引号或换行，
+    复制后命令会被改写甚至注入额外语句。这里只保留路径语义、剔除引号类字符。
+    """
+    return (
+        str(path)
+        .replace('"', "")
+        .replace("'", "")
+        .replace("`", "")
+        .replace("$", "")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
+
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
@@ -149,7 +167,7 @@ def report_optical(info: Dict[str, Any], path: str) -> None:
     print()
     print("  命令行方式：")
     print(f'     python -c "from src import FloodDetector; '
-          f'print(FloodDetector(mode=\'baseline\').detect(r\'{path}\').summary_text())"')
+          f'print(FloodDetector(mode=\'baseline\').detect(r\'{shell_safe_path(path)}\').summary_text())"')
 
 
 def report_sentinel1(path: str, safe_dirs: List[str], zips: List[str]) -> None:
@@ -160,11 +178,12 @@ def report_sentinel1(path: str, safe_dirs: List[str], zips: List[str]) -> None:
     if len(safe_dirs) >= 2:
         pre, post = safe_dirs[0], safe_dirs[-1]
         print("  ✅ 检测到两景（灾前 + 灾后），直接跑：")
-        print(f'     python scripts/prepare_s1_sar.py --pre "{pre}" --post "{post}" '
-              f'--pol VV --out data/my_flood --size 4096')
+        print(f'     python scripts/prepare_s1_sar.py --pre "{shell_safe_path(pre)}" '
+              f'--post "{shell_safe_path(post)}" --pol VV --out data/my_flood --size 4096')
         print()
         print("  也可以先看数据信息：")
-        print(f'     python scripts/prepare_s1_sar.py --pre "{pre}" --post "{post}" --info')
+        print(f'     python scripts/prepare_s1_sar.py --pre "{shell_safe_path(pre)}" '
+              f'--post "{shell_safe_path(post)}" --info')
     elif len(safe_dirs) == 1:
         print("  ⚠️ 只有一景：单时相也能提取水体范围，但没法算「新增淹没」")
         print("     建议再下载一景（灾前或灾后）做对比")

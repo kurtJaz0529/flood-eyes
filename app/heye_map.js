@@ -9,7 +9,6 @@
     '<div class="heye-layers">' +
     '<button type="button" data-ly="amap" class="on">高德</button>' +
     '<button type="button" data-ly="sat">影像</button>' +
-    '<button type="button" data-ly="geoq">智图</button>' +
     "</div>" +
     '<div class="heye-pin"></div>';
   const tilesEl = root.querySelector(".heye-tiles");
@@ -69,7 +68,6 @@
     if (x < 0 || y < 0 || x >= n || y >= n) return "";
     const s = (x + y) % 4;
     if (ly === "sat") return "https://webst0" + (s + 1) + ".is.autonavi.com/appmaptile?style=6&x=" + x + "&y=" + y + "&z=" + z;
-    if (ly === "geoq") return "https://map.geoq.cn/ArcGIS/rest/services/ChinaOnlineCommunity/MapServer/tile/" + z + "/" + y + "/" + x;
     return "https://webrd0" + (s + 1) + ".is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=" + x + "&y=" + y + "&z=" + z;
   }
 

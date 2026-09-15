@@ -38,6 +38,19 @@ except Exception:  # pragma: no cover
 from src.sar import DEFAULT_WATER_DB, load_s1_scene, process_sar_pair  # noqa: E402
 
 
+def confine_to_root(path: str, root: str) -> str:
+    """校验 path 规范化后位于 root 目录内，返回规范化路径；越界则抛错。
+
+    输出目录来自命令行，清单与临时文件都由它派生。集中在一处做边界校验，
+    避免任何派生路径越出目标目录。
+    """
+    root_real = os.path.realpath(root)
+    target = os.path.realpath(path)
+    if target != root_real and not target.startswith(root_real + os.sep):
+        raise ValueError(f"路径越界，已拒绝：{target}（允许目录 {root_real}）")
+    return target
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -74,7 +87,19 @@ def main() -> int:
 
     aoi = None
     if args.aoi:
-        lon, lat = [float(v) for v in args.aoi.split(",")]
+        # 原实现直接 [float(v) for v in split(",")]：逗号多了/少了/非数字都会抛裸
+        # ValueError，也不校验经纬度范围，错误的 AOI 会一路带进处理链。
+        parts = [p.strip() for p in str(args.aoi).split(",")]
+        if len(parts) != 2:
+            raise SystemExit(f"--aoi 需要“经度,纬度”两个值，收到：{args.aoi!r}")
+        try:
+            lon, lat = float(parts[0]), float(parts[1])
+        except ValueError:
+            raise SystemExit(f"--aoi 必须是数字，收到：{args.aoi!r}") from None
+        if not (-180.0 <= lon <= 180.0):
+            raise SystemExit(f"--aoi 经度超出 [-180,180]：{lon}")
+        if not (-90.0 <= lat <= 90.0):
+            raise SystemExit(f"--aoi 纬度超出 [-90,90]：{lat}")
         aoi = (lon, lat)
 
     result = process_sar_pair(
@@ -85,11 +110,22 @@ def main() -> int:
 
     # 追加到清单
     mpath = os.path.join(args.out, "samples.json")
+    # 清单路径必须落在输出目录内（--out 来自命令行，规范化后校验前缀）
+    out_real = os.path.realpath(args.out)
+    mpath = os.path.realpath(mpath)
+    if not mpath.startswith(out_real + os.sep):
+        raise SystemExit(f"清单路径越界，已拒绝写入：{mpath}")
     samples = []
     if os.path.isfile(mpath):
         try:
-            samples = json.load(open(mpath, encoding="utf-8")).get("samples", [])
-        except Exception:
+            # 用 with 关闭句柄：Windows 下未释放的句柄会让随后的覆写失败
+            with open(mpath, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            samples = loaded.get("samples", []) if isinstance(loaded, dict) else []
+            if not isinstance(samples, list):
+                samples = []
+        except (OSError, ValueError) as exc:
+            print(f"[warn] 无法解析已有清单 {mpath}（{type(exc).__name__}），按空清单处理")
             samples = []
     entry = {
         "id": result["id"],
@@ -103,9 +139,17 @@ def main() -> int:
         "provenance": result["provenance"],
     }
     samples = [s for s in samples if s.get("id") != entry["id"]] + [entry]
-    with open(mpath, "w", encoding="utf-8") as fh:
-        json.dump({"note": "Sentinel-1 SAR 处理成果（σ0 dB）", "samples": samples}, fh,
-                  ensure_ascii=False, indent=2)
+    # 原子替换：直接覆写若中途崩溃/断电会留下截断 JSON，下次加载只能清空整个清单。
+    # 先写同目录临时文件，再 os.replace 原子改名（路径已由 confine_to_root 校验）。
+    from pathlib import Path
+
+    tmp_file = Path(confine_to_root(mpath + ".tmp", args.out))
+    tmp_file.write_text(
+        json.dumps({"note": "Sentinel-1 SAR 处理成果（σ0 dB）", "samples": samples},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(str(tmp_file), mpath)
 
     log(f"✓ 成果已写入 {args.out}")
     for k, v in result["paths"].items():

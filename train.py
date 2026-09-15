@@ -117,11 +117,18 @@ class FloodDataset(Dataset):
         item = self.items[idx % len(self.items)]
         scene = load_scene(item["image"], band_order=self.band_order)
         mask = _read_mask(item["mask"])
-        names = [b for b in ("blue", "green", "red", "nir") if b in scene.bands]
-        chw = scene.stack(names)  # (C,H,W) 反射率
-        if chw.shape[0] < 4:  # 补齐到 4 通道
-            pad = np.zeros((4 - chw.shape[0], *chw.shape[1:]), dtype=np.float32)
-            chw = np.concatenate([chw, pad], axis=0)
+        # 通道顺序必须固定为 blue/green/red/nir：模型与归一化均按此顺序定义。
+        # 原实现先过滤缺失波段、再把补零通道追加到末尾，一旦中间少一个波段
+        # （例如缺 red），实际堆叠会变成 [blue, green, nir, 0] 而模型仍按
+        # [blue, green, red, nir] 解释——训练不报错，只是精度莫名下降。
+        required = ("blue", "green", "red", "nir")
+        missing_bands = [b for b in required if b not in scene.bands]
+        if missing_bands:
+            raise ValueError(
+                f"{item['image']} 缺少波段 {missing_bands}，"
+                f"实际只有 {sorted(scene.bands)}；训练要求 4 波段（blue/green/red/nir）齐全。"
+            )
+        chw = scene.stack(list(required))  # (4,H,W) 反射率，顺序固定
         if mask.shape != chw.shape[1:]:
             raise ValueError(f"{item['image']} 与 {item['mask']} 尺寸不一致：{chw.shape[1:]} vs {mask.shape}")
         return chw, mask.astype(np.float32)
@@ -358,8 +365,17 @@ def main() -> None:
     print(f"[model] {info}  参数量={count_parameters(model)/1e6:.2f} M")
 
     if args.resume and os.path.isfile(args.resume):
-        state = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(state["state_dict"], strict=False)
+        # 断点权重可能来自他人分享/网盘，必须安全反序列化：
+        # weights_only=False 会在 load_state_dict 之前执行 pickle 中的任意代码。
+        try:
+            state = torch.load(args.resume, map_location=device, weights_only=True)
+        except Exception as exc:
+            raise SystemExit(
+                f"[model] 断点文件无法安全加载：{args.resume}（{type(exc).__name__}: {exc}）。\n"
+                f"        本程序只接受标准 torch.save 保存的检查点；请确认文件来源可信且未损坏。"
+            ) from exc
+        # 严格加载：缺失/多余键说明结构不一致，静默放行会让部分层保持随机初始化。
+        model.load_state_dict(state["state_dict"], strict=True)
         print(f"[model] 已加载 {args.resume} 继续训练")
 
     criterion = DiceBCELoss(args.bce_weight, args.dice_weight).to(device)

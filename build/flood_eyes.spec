@@ -21,12 +21,20 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_sub
 SPEC_DIR = os.path.abspath(SPECPATH)  # SPECPATH 本身就是 spec 所在目录
 ROOT = os.path.dirname(SPEC_DIR)
 
-PROFILE = os.environ.get("FLOOD_PROFILE", "full").strip().lower()
+# 默认值必须与文件头注释、build_app.ps1 保持一致（都是 lite）。
+# 原默认是 full：直接执行 pyinstaller build/flood_eyes.spec 会意外打出 ~900MB
+# 的完整包，并先把 PyTorch 一并塞进分发物。
+PROFILE = os.environ.get("FLOOD_PROFILE", "lite").strip().lower()
+if PROFILE not in ("lite", "full"):
+    raise SystemExit(f"[spec] 未知的 FLOOD_PROFILE={PROFILE!r}，只能是 lite 或 full")
 LITE = PROFILE == "lite"
 CONSOLE = os.environ.get("FLOOD_CONSOLE", "0") == "1"
 APP_NAME = os.environ.get("FLOOD_APP_NAME", "慧眼识灾")
 
 print(f"[spec] 打包配置：profile={PROFILE}  console={CONSOLE}  app={APP_NAME}")
+if "FLOOD_PROFILE" not in os.environ:
+    print("[spec] 注意：未显式设置 FLOOD_PROFILE，已按 lite（精简版，不含 PyTorch）打包；"
+          "需要完整版请先 set FLOOD_PROFILE=full")
 
 # --------------------------------------------------------------------------
 # 资源
@@ -41,10 +49,22 @@ for sub in ("samples", "real"):
     if os.path.isdir(path):
         datas.append((path, os.path.join("data", sub)))
 
-# 1b) 界面样式与全流程脚本（frozen 后要从 bundle_root 读）
-_css = os.path.join(ROOT, "app", "apple.css")
-if os.path.isfile(_css):
-    datas.append((_css, "app"))
+# 1a) 内置洪灾事件库（src/events.py 在运行时从 bundle_root/data/events 读取）
+_events = os.path.join(ROOT, "data", "events")
+if os.path.isdir(_events):
+    datas.append((_events, os.path.join("data", "events")))
+else:
+    print("[spec] 警告：未找到 data/events，打包后事件库将为空、检索功能不可用")
+
+# 1b) 界面资源与全流程脚本（frozen 后要从 bundle_root 读）
+#     注意：heye_map.js 是**数据文件**（运行时按路径读取），不是导入的模块，
+#     PyInstaller 不会自动收集——漏掉它打包后地图区域会空白。
+for name in ("apple.css", "heye_map.js"):
+    p = os.path.join(ROOT, "app", name)
+    if os.path.isfile(p):
+        datas.append((p, "app"))
+    else:
+        print(f"[spec] 警告：未找到 app/{name}")
 _scripts = os.path.join(ROOT, "scripts")
 if os.path.isdir(_scripts):
     for name in ("fetch_real_samples.py", "fetch_s1_rtc.py", "check_data.py"):

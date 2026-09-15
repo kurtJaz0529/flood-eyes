@@ -7,8 +7,8 @@
 ;   · 安装完可选择立即启动
 ;
 ; 编译（两种版本）：
-;   ISCC.exe /DProfile=lite build\installer.iss    -> 慧眼识灾_安装程序_v0.2.0_精简版.exe
-;   ISCC.exe /DProfile=full build\installer.iss    -> 慧眼识灾_安装程序_v0.2.0_完整版.exe
+;   ISCC.exe /DProfile=lite build\installer.iss    -> 慧眼识灾_安装程序_v0.3.1_精简版.exe
+;   ISCC.exe /DProfile=full build\installer.iss    -> 慧眼识灾_安装程序_v0.3.1_完整版.exe
 ;
 ; 也可以用 build/build_installer.ps1 一键编译。
 
@@ -27,7 +27,7 @@
 #endif
 
 #define AppName "慧眼识灾"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.1"
 #define AppPublisher "慧眼识灾团队"
 #define AppExeName "慧眼识灾.exe"
 

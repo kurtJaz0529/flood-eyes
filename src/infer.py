@@ -161,24 +161,33 @@ class FloodDetector:
         self._model = None
         self._model_meta: Dict[str, Any] = {}
         self._load_error: Optional[str] = None
-        self._synthetic_weights: Optional[bool] = None
+        self._synthetic_weights = {}  # 按权重绝对路径缓存，避免多权重互相污染
 
     # -- 模型加载 ----------------------------------------------------------
     def _weights_looks_synthetic(self, path: str) -> bool:
-        if self._synthetic_weights is not None:
-            return self._synthetic_weights
+        """权重是否只在合成样本上训练过（auto 模式据此决定是否启用 U-Net）。
+
+        结论按权重绝对路径分别缓存：同一个 detector 先后接触多个权重文件时，
+        用单一布尔缓存会把真实权重误判成合成（或反之），导致 auto 选错模型。
+        """
+        key = os.path.normcase(os.path.abspath(path))
+        if key in self._synthetic_weights:
+            return self._synthetic_weights[key]
+        looks_synthetic = False
         try:
             import torch
 
-            try:
-                payload = torch.load(path, map_location="cpu", weights_only=True)
-            except Exception:
-                payload = torch.load(path, map_location="cpu", weights_only=False)
+            # 只接受安全反序列化。权重文件可能取自用户目录、网盘或第三方，
+            # weights_only=False 会在加载前执行 pickle，等同于任意代码执行；
+            # 因此宁可读不出元数据，也不回退到不安全加载。
+            payload = torch.load(path, map_location="cpu", weights_only=True)
             note = str((payload.get("meta") or {}).get("data_note") or "")
-            self._synthetic_weights = "synthetic" in note.lower()
+            looks_synthetic = "synthetic" in note.lower()
         except Exception:
-            self._synthetic_weights = False
-        return self._synthetic_weights
+            # 旧格式/损坏/非 torch.save 文件：按"非合成"处理，与既有行为一致。
+            looks_synthetic = False
+        self._synthetic_weights[key] = looks_synthetic
+        return looks_synthetic
 
     @property
     def resolved_mode(self) -> str:

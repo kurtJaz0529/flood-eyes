@@ -40,9 +40,10 @@ W, H = 1920, 1080
 ZOOM = 1.25          # CSS zoom，放大字体
 TARGET_MIN_S = 65.0  # 不足则补静止帧，保证总时长在 60-90s 目标区间
 
-FFMPEG_FALLBACK = (r"C:\Users\21679\AppData\Local\Microsoft\WinGet\Packages"
-                   r"\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe"
-                   r"\ffmpeg-8.1.1-essentials_build\bin\ffmpeg.exe")
+# ffmpeg 位置按 环境变量 -> PATH 查找。原实现在这里写死了开发者本机的
+# WinGet 绝对路径（含用户名），换机器必然找不到，且会把个人目录结构随
+# 脚本一起分发出去。
+FFMPEG_ENV = "HUIYAN_FFMPEG"
 
 T0 = time.time()
 
@@ -61,11 +62,13 @@ def shot(page, name: str) -> None:
 
 
 def find_ffmpeg() -> str | None:
+    # 1) 显式指定的路径（HUIYAN_FFMPEG）2) PATH 查找
+    explicit = os.environ.get(FFMPEG_ENV, "").strip().strip('"')
+    if explicit and os.path.isfile(explicit):
+        return explicit
     exe = shutil.which("ffmpeg")
     if exe:
         return exe
-    if os.path.isfile(FFMPEG_FALLBACK):
-        return FFMPEG_FALLBACK
     return None
 
 

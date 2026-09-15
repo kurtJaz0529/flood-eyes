@@ -239,13 +239,20 @@ def save_checkpoint(path: str, model: nn.Module, meta: Dict[str, Any]) -> str:
 def load_checkpoint(path: str, device: str = "cpu") -> Tuple[nn.Module, Dict[str, Any]]:
     """读取权重并重建模型结构。meta 里记录了 arch/encoder/in_channels。
 
-    arch 会做别名映射（smp_unet → smp）。结构对不上就抛错，避免 strict=False
-    把 SMP 权重静默装进随机初始化的 TinyUNet。
+    arch 会做别名映射（smp_unet → smp）。结构对不上就抛错，避免把不匹配的权重
+    静默装进随机初始化的模型。
+
+    加载只接受 weights_only=True（安全反序列化）：权重可能来自用户目录、网盘
+    或第三方，关闭该选项会在 load_state_dict 之前执行 pickle，等于任意代码执行。
     """
     try:
         payload = torch.load(path, map_location=device, weights_only=True)
-    except Exception:
-        payload = torch.load(path, map_location=device, weights_only=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"权重无法安全加载：{path}（{type(exc).__name__}: {exc}）。"
+            "本程序只接受标准 torch.save 保存的权重；"
+            "若该文件来自旧版本或第三方，请用 train.py 重新导出后再使用。"
+        ) from exc
     meta = dict(payload.get("meta", {}))
     arch = normalize_arch(meta.get("arch_key") or meta.get("arch", "auto"))
     model, info = build_model(
@@ -257,18 +264,23 @@ def load_checkpoint(path: str, device: str = "cpu") -> Tuple[nn.Module, Dict[str
         base=int(meta.get("base", 16)),
     )
     state = payload["state_dict"]
-    missing, unexpected = model.load_state_dict(state, strict=False)
     n_params = len(model.state_dict())
-    if len(missing) > max(2, n_params // 10) or len(unexpected) > max(2, n_params // 10):
+    try:
+        # 严格加载：任何缺失/多余键都判为结构不匹配。
+        # 原实现用 strict=False 配"缺失数不超过 10%"的阈值放行，少量层
+        # （BN 统计量、head 偏置等）会保持随机初始化，输出掩膜"看着正常"却是错的，
+        # 而且没有任何提示。宁可拒绝加载，也不要静默用半随机权重出结果。
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
         raise RuntimeError(
-            f"权重与模型结构不匹配：arch={arch} missing={len(missing)}/{n_params} "
-            f"unexpected={len(unexpected)}。拒绝加载，以免使用随机权重。"
-        )
+            f"权重与模型结构不匹配：arch={arch}（模型 {n_params} 个参数张量）。"
+            f"请确认该权重由同一份 train.py 导出。底层错误：{exc}"
+        ) from exc
     meta.update({
         "model_info": info,
         "arch_key": arch,
-        "missing_keys": list(missing),
-        "unexpected_keys": list(unexpected),
+        "missing_keys": [],
+        "unexpected_keys": [],
     })
     model.to(device).eval()
     return model, meta

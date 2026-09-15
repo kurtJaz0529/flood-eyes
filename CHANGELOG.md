@@ -15,6 +15,14 @@
 
 ### 新增
 
+- **品牌 logo 接入**：应用图标改为由品牌 logo 生成（取其中的眼睛图形），
+  不再使用程序化合成的备选图案
+  - `scripts/make_icon.py` 改为从 `docs/assets/logo_source.jpg` 生成多尺寸 `.ico`、
+    256px PNG 与完整字标 PNG；原图缺失时退回原有合成画法
+  - exe 图标、安装程序图标、桌面快捷方式图标随之更新（spec 的 `icon=` 与
+    `installer.iss` 的 `SetupIconFile=` 均指向该 `.ico`）
+  - 界面顶栏 logo 以 data URI 内联（无外部请求，离线与打包环境都稳）
+  - 浏览器标签页图标（Gradio `favicon_path`）
 - **洪灾事件库与检索**（`src/events.py`、`data/events/flood_events.json`、`scripts/events.py`）
   - 内置 17 起有据可查的洪灾事件，支持关键词 / 年份 / 地区 / **邻近**检索
   - 事件只需一个日期，灾前/灾后时间窗由 `build_template()` 按统一规则推导

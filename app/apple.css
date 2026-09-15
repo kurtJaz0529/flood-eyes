@@ -105,8 +105,10 @@ html.heye-dark {
   width: 36px;
   height: 36px;
   border-radius: 12px;
-  background: linear-gradient(180deg, #3d3d42 0%, #1d1d1f 100%);
-  color: #fff;
+  /* 品牌图标自带白底圆角，容器保持透明即可；下面的深色渐变只作为
+     图标文件缺失时「眼」文字占位的兜底底色 */
+  background: transparent;
+  color: #0b3d91;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -114,6 +116,19 @@ html.heye-dark {
   font-size: 14px;
   letter-spacing: 0.02em;
   flex-shrink: 0;
+  overflow: hidden;
+}
+.heye-logo img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: 12px;
+  object-fit: contain;
+}
+/* 图标缺失、退回文字占位时，用深色底保证「眼」字可见 */
+.heye-logo:not(:has(img)) {
+  background: linear-gradient(180deg, #3d3d42 0%, #1d1d1f 100%);
+  color: #fff;
 }
 .heye-nav h1 {
   margin: 0;

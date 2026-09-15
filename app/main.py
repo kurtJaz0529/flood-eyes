@@ -142,19 +142,54 @@ def _blocks_kwargs(title: str) -> Dict[str, Any]:
     return kw
 
 
+@functools.lru_cache(maxsize=1)
+def _logo_path() -> Optional[str]:
+    """应用图标文件（浏览器的 favicon 与顶栏 logo 共用同一张）。
+
+    位于 docs/assets/app_icon.png，由 scripts/make_icon.py 从品牌 logo 生成。
+    打包时该文件随 datas 一起进包，因此 source / frozen 两种模式都能取到。
+    """
+    candidate = os.path.join(bundle_root(), "docs", "assets", "app_icon.png")
+    return candidate if os.path.isfile(candidate) else None
+
+
+@functools.lru_cache(maxsize=1)
+def _logo_data_uri() -> str:
+    """顶栏 logo 的 data URI。
+
+    内联而不走外部请求：避免额外文件路径依赖，离线与打包环境都稳定。
+    图标缺失时返回空串，顶栏退回原来的文字占位。
+    """
+    path = _logo_path()
+    if not path:
+        return ""
+    try:
+        import base64
+        from pathlib import Path as _Path
+
+        return "data:image/png;base64," + base64.b64encode(_Path(path).read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+
+
 def _launch_kwargs() -> Dict[str, Any]:
+    kw: Dict[str, Any] = {}
     if GRADIO_MAJOR >= 6:
-        return {"theme": _apple_theme(), "css": CSS, "js": _THEME_JS}
-    return {}
+        kw.update(theme=_apple_theme(), css=CSS, js=_THEME_JS)
+    icon = _logo_path()
+    if icon:
+        kw["favicon_path"] = icon      # 浏览器标签页图标
+    return kw
 
 CHOICES = sample_choices()
 DEFAULT_SAMPLE = CHOICES[0][1] if CHOICES else None
 DEFAULT_SAMPLE2 = CHOICES[1][1] if len(CHOICES) > 1 else DEFAULT_SAMPLE
 
-HEADER = """
+
+_HEADER_TEMPLATE = """
 <div class="heye-nav">
   <div class="heye-nav-left">
-    <div class="heye-logo">眼</div>
+    __LOGO__
     <div>
       <h1>慧眼识灾</h1>
       <p>地图选点 · 自动下载 · 灾前灾后对比</p>
@@ -163,6 +198,21 @@ HEADER = """
   <button type="button" class="heye-theme" title="深浅色" onclick="(function(){var r=document.documentElement;var d=r.classList.toggle('heye-dark');r.classList.toggle('heye-light',!d);try{localStorage.setItem('heye-theme',d?'dark':'light')}catch(e){}})()">◐</button>
 </div>
 """
+
+
+def _header_html() -> str:
+    """顶栏：品牌 logo + 标题 + 深浅色切换。
+
+    刻意用占位符 + replace 而不是 f-string：下面的按钮 onclick 里满是 `{` `}`，
+    放进 f-string 会被当成替换字段而语法报错。
+    """
+    uri = _logo_data_uri()
+    if uri:
+        logo = f'<div class="heye-logo"><img src="{uri}" alt="慧眼识灾"></div>'
+    else:
+        logo = '<div class="heye-logo">眼</div>'   # 图标缺失时的降级
+    return _HEADER_TEMPLATE.replace("__LOGO__", logo)
+
 
 FOOTER = f"""
 <p class="heye-foot">
@@ -985,7 +1035,7 @@ def load_event_template(event_id: Optional[str]):
 def build_ui(baseline_only: bool = False) -> gr.Blocks:
     _ = baseline_only
     with gr.Blocks(**_blocks_kwargs("慧眼识灾 · 遥感 AI 洪水识别系统")) as demo:
-        gr.HTML(HEADER)
+        gr.HTML(_header_html())
         gr.Markdown(
             "在地图上点选任意地点（或搜索地名），填好灾前/灾后时间范围后一键分析。"
             "系统按所选地点下载 Sentinel-2 公开影像并对比，首次下载约 1–3 分钟，同一地点再次分析走本地缓存。"

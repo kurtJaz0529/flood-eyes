@@ -72,6 +72,14 @@ if os.path.isdir(_scripts):
         if os.path.isfile(p):
             datas.append((p, "scripts"))
 
+# 1c) 应用图标：顶栏 logo（内联为 data URI）与浏览器 favicon 都读它。
+#     同样属于"运行时按路径读取"的数据文件，PyInstaller 不会自动收集。
+_icon = os.path.join(ROOT, "docs", "assets", "app_icon.png")
+if os.path.isfile(_icon):
+    datas.append((_icon, os.path.join("docs", "assets")))
+else:
+    print("[spec] 警告：未找到 docs/assets/app_icon.png，顶栏与浏览器标签将退回文字占位")
+
 # 2) 权重（精简版不需要：没有 torch 也加载不了）
 if not LITE:
     for weight in glob.glob(os.path.join(ROOT, "weights", "*.pt")):

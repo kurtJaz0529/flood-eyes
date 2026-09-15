@@ -1,0 +1,1028 @@
+"""
+慧眼识灾 · Gradio 演示入口
+===========================
+
+启动：
+    python app/main.py                 # http://127.0.0.1:7860
+    python app/main.py --share         # 生成公网链接（路演/远程评审用）
+    python app/main.py --port 8080 --baseline-only
+
+单页：地图选点 + 灾前/灾后时间范围 → 自动下载卫星数据 → 识别并对比。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    pass
+
+import gradio as gr  # noqa: E402
+
+from app.components import (  # noqa: E402
+    HAS_IMAGE_SLIDER,
+    compare_figure,
+    empty_stats_html,
+    export_result,
+    image_slider_component,
+    load_manifest,
+    pipeline_html,
+    sample_choices,
+    sample_paths,
+    stats_html,
+)
+from src import __version__ as APP_VERSION  # noqa: E402
+from src.infer import FloodDetector, available_weights  # noqa: E402
+from src.paths import bundle_root, outputs_dir, samples_dir, weights_dirs  # noqa: E402
+from src.preprocess import load_scene  # noqa: E402
+from src.report import export_bundle  # noqa: E402
+
+ROOT = bundle_root()
+SAMPLES_DIR = samples_dir()
+OUT_DIR = outputs_dir()
+
+# --------------------------------------------------------------------------
+# Gradio 版本兼容层（5.x / 6.x 的 API 有差异，保证两代都能跑）
+# --------------------------------------------------------------------------
+
+GRADIO_MAJOR = int(gr.__version__.split(".")[0])
+
+
+def _load_apple_css() -> str:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apple.css")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return ".gradio-container {max-width: 1280px !important}"
+
+
+CSS = _load_apple_css()
+
+
+def _apple_theme() -> Any:
+    try:
+        return gr.themes.Soft(
+            font=["ui-sans-serif", "system-ui", "sans-serif"],
+            primary_hue="blue",
+            neutral_hue="slate",
+            spacing_size="md",
+            radius_size="lg",
+        )
+    except Exception:
+        return gr.themes.Soft()
+
+
+def _textbox(**kwargs: Any) -> Any:
+    """Gradio 6 用 buttons=[...] 取代了 show_copy_button。"""
+    kw = dict(kwargs)
+    if "show_copy_button" in kw:
+        copy = bool(kw.pop("show_copy_button"))
+        if GRADIO_MAJOR >= 6:
+            if copy:
+                try:
+                    return gr.Textbox(**kw, buttons=["copy"])
+                except Exception:
+                    pass
+        else:
+            kw["show_copy_button"] = copy
+    return gr.Textbox(**kw)
+
+
+_THEME_JS = """
+() => {
+  try {
+    const t = localStorage.getItem('heye-theme');
+    if (t === 'dark') {
+      document.documentElement.classList.add('heye-dark');
+      document.documentElement.classList.remove('heye-light');
+    }
+  } catch (e) {}
+}
+"""
+
+
+def _blocks_kwargs(title: str) -> Dict[str, Any]:
+    kw: Dict[str, Any] = {"title": title}
+    if GRADIO_MAJOR < 6:  # 6.x 起 theme/css/js 移到 launch()
+        kw.update(theme=_apple_theme(), css=CSS, js=_THEME_JS)
+    else:
+        try:  # 6.x 默认把内容限制在 ~1168px，横向布局需要更宽的画布
+            import inspect
+
+            if "fill_width" in inspect.signature(gr.Blocks.__init__).parameters:
+                kw["fill_width"] = True
+        except Exception:
+            pass
+    return kw
+
+
+def _launch_kwargs() -> Dict[str, Any]:
+    if GRADIO_MAJOR >= 6:
+        return {"theme": _apple_theme(), "css": CSS, "js": _THEME_JS}
+    return {}
+
+CHOICES = sample_choices()
+DEFAULT_SAMPLE = CHOICES[0][1] if CHOICES else None
+DEFAULT_SAMPLE2 = CHOICES[1][1] if len(CHOICES) > 1 else DEFAULT_SAMPLE
+
+HEADER = """
+<div class="heye-nav">
+  <div class="heye-nav-left">
+    <div class="heye-logo">眼</div>
+    <div>
+      <h1>慧眼识灾</h1>
+      <p>地图选点 · 自动下载 · 灾前灾后对比</p>
+    </div>
+  </div>
+  <button type="button" class="heye-theme" title="深浅色" onclick="(function(){var r=document.documentElement;var d=r.classList.toggle('heye-dark');r.classList.toggle('heye-light',!d);try{localStorage.setItem('heye-theme',d?'dark':'light')}catch(e){}})()">◐</button>
+</div>
+"""
+
+FOOTER = f"""
+<p class="heye-foot">
+  Huiyan {APP_VERSION}　本机计算，不经过大模型<br>
+  默认 NDWI 基线　合成权重不可作为竞赛精度
+</p>
+"""
+
+
+# --------------------------------------------------------------------------
+# 回调
+# --------------------------------------------------------------------------
+
+
+def _pick_source(upload: Optional[Any], sample_id: Optional[str], which: str = "post") -> Tuple[str, List[str]]:
+    """优先使用上传文件，否则用示例样本。返回 (路径, 提示列表)。"""
+    notes: List[str] = []
+    path = ""
+    if upload:
+        path = upload if isinstance(upload, str) else getattr(upload, "name", str(upload))
+    if not path:
+        if not sample_id:
+            raise gr.Error("请上传影像，或在下拉框中选择一个示例样本")
+        paths = sample_paths(sample_id)
+        path = paths[which]
+        notes.append(f"使用示例样本：{os.path.basename(path)}")
+    if not os.path.isfile(path):
+        raise gr.Error(f"文件不存在：{path}")
+    return path, notes
+
+
+def _resolve_weights(weights: Optional[str]) -> Optional[str]:
+    """把界面下拉框的值转成真实权重路径；占位符 -> None（自动选择）。"""
+    if not weights or weights.startswith("（"):
+        return None
+    if os.path.isabs(weights) and os.path.isfile(weights):
+        return weights
+    for d in weights_dirs():  # 用户目录 -> 打包资源目录
+        probe = os.path.join(d, os.path.basename(weights))
+        if os.path.isfile(probe):
+            return probe
+    return None
+
+
+def _coerce_pixel_size(value: Any) -> Optional[float]:
+    """0 / 空 = 从影像读取分辨率。"""
+    if value is None or value == "":
+        return None
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if x <= 0 else x
+
+
+def _make_detector(
+    mode_label: str,
+    pixel_size_m: float,
+    min_area_px: float,
+    threshold: float,
+    tta: bool,
+    weights: Optional[str],
+) -> FloodDetector:
+    mode = {"自动（非合成权重才用 U-Net）": "auto", "NDWI + Otsu 基线": "baseline", "U-Net 深度模型": "unet"}.get(
+        mode_label, "baseline"
+    )
+    return FloodDetector(
+        mode=mode,
+        weights=_resolve_weights(weights),
+        pixel_size_m=_coerce_pixel_size(pixel_size_m),
+        min_area_px=int(min_area_px),
+        threshold=float(threshold),
+        tta=bool(tta),
+    )
+
+
+def run_single(
+    upload: Optional[Any],
+    nir_upload: Optional[Any],
+    sample_id: Optional[str],
+    mode_label: str,
+    pixel_size_m: float,
+    min_area_px: float,
+    threshold: float,
+    tta: bool,
+    weights: Optional[str],
+):
+    try:
+        path, notes = _pick_source(upload, sample_id, which="post")
+        nir_path = None
+        if nir_upload:
+            nir_path = nir_upload if isinstance(nir_upload, str) else getattr(nir_upload, "name", str(nir_upload))
+        det = _make_detector(mode_label, pixel_size_m, min_area_px, threshold, tta, weights)
+        result = det.detect(path, nir_path=nir_path)
+
+        overlay = result.overlay
+        slider_value = (result.rgb, overlay) if HAS_IMAGE_SLIDER else result.rgb
+        log = "\n".join(
+            notes
+            + [
+                f"输入：{os.path.basename(path)}  {result.scene.shape[0]}×{result.scene.shape[1]}  "
+                f"{len(result.scene.channel_names)} 波段（近红外：{'有' if result.scene.has_nir else '无'}）",
+                f"模型：{result.meta.get('model_label')}",
+                f"耗时：{result.elapsed_s:.2f} s",
+                result.summary_text(),
+            ]
+        )
+        zip_path = export_result(result, OUT_DIR)
+        return slider_value, overlay, stats_html(result), result.summary_text(), zip_path, log
+    except gr.Error:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(f"识别失败：{type(exc).__name__}: {exc}") from exc
+
+
+def run_compare(
+    pre_upload: Optional[Any],
+    post_upload: Optional[Any],
+    sample_id: Optional[str],
+    mode_label: str,
+    pixel_size_m: float,
+    min_area_px: float,
+    threshold: float,
+    weights: Optional[str],
+):
+    try:
+        pre_path, notes = _pick_source(pre_upload, sample_id, which="pre")
+        post_path, _ = _pick_source(post_upload, sample_id, which="post")
+        det = _make_detector(mode_label, pixel_size_m, min_area_px, threshold, False, weights)
+        result = det.compare(pre_path, post_path)
+
+        change = result.change
+        slider_value = (change["before_overlay"], change["after_overlay"]) if HAS_IMAGE_SLIDER else change["after_overlay"]
+        log = "\n".join(
+            notes
+            + [
+                f"灾前：{os.path.basename(pre_path)}",
+                f"灾后：{os.path.basename(post_path)}",
+                f"模型：{result.meta.get('model_label')}",
+                f"耗时：{result.elapsed_s:.2f} s",
+                result.summary_text(),
+            ]
+        )
+        zip_path = export_result(result, OUT_DIR)
+        return slider_value, compare_figure(result), stats_html(result), result.summary_text(), zip_path, log
+    except gr.Error:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(f"对比失败：{type(exc).__name__}: {exc}") from exc
+
+
+def show_model_info(mode_label: str, weights: Optional[str]) -> str:
+    det = _make_detector(mode_label, 10.0, 120, 0.5, False, weights)
+    info = det.model_info()
+    return pipeline_html(info)
+
+
+# --------------------------------------------------------------------------
+# 雷达（SAR）回调
+# --------------------------------------------------------------------------
+
+_SAR_CSS = ""
+
+
+def _load_script(name: str) -> Any:
+    """按路径加载 scripts/*.py，打包后也能找到。"""
+    import importlib.util
+
+    path = os.path.join(ROOT, "scripts", f"{name}.py")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"找不到脚本：{path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _preset_events() -> Dict[str, Dict[str, Any]]:
+    return _load_script("fetch_real_samples").EVENTS
+
+
+def _sar_stats_html(result: Dict[str, Any]) -> str:
+    s = result["stats"]
+    p = result["provenance"]
+    lonlat = p.get("aoi_lonlat") or [0, 0]
+    lon, lat = lonlat[0], lonlat[1]
+    src = p.get("aoi_source") or p.get("source") or "-"
+    return f"""
+<div class="heye-stats">
+  <div class="heye-hero">
+    <div class="t">新增淹没面积</div>
+    <div class="n danger">{s['new_water_km2']:,.2f}<small> km²</small></div>
+    <div class="heye-bar"><i style="width:{min(100.0, 100 * s['new_water_km2'] / max(s['window_km2'], 1)):.1f}%"></i></div>
+  </div>
+  <div>
+    <span class="heye-tag info">Sentinel-1 {p['polarization']}</span>
+    <span class="heye-tag">阈值 {s['threshold_db']:.1f} dB</span>
+    <span class="heye-tag">窗口 {p['window'][0]}×{p['window'][1]}</span>
+    <span class="heye-tag">定位 {src} @ {lon},{lat}</span>
+  </div>
+  <div class="heye-grid">
+    <div class="heye-card"><div class="k">灾前水体</div><div class="v">{s['pre_water_km2']:.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">灾后水体</div><div class="v">{s['post_water_km2']:.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">持续水体</div><div class="v">{s['persistent_km2']:.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">退水面积</div><div class="v" style="color:var(--success)">{s['receded_km2']:.2f}<small> km²</small></div></div>
+  </div>
+  <div style="font-size:12px;color:#5b6b7f;margin-top:6px">
+    灾前景 {p['pre_scene'][:46]}…<br>灾后景 {p['post_scene'][:46]}…
+  </div>
+</div>"""
+
+
+def run_sar(pre_path: str, post_path: str, polarization: str, threshold_db: float, size: int):
+    """雷达双时相处理：本地 SAFE 目录 → 水体范围 + 变化统计 + 成果包。"""
+    import json
+    import zipfile
+
+    from src.sar import process_sar_pair
+
+    logs: List[str] = []
+
+    def prog(msg: str) -> None:
+        logs.append(msg)
+        print(f"[SAR] {msg}")
+
+    try:
+        for tag, p in (("灾前", pre_path), ("灾后", post_path)):
+            if not p or not os.path.exists(p.strip()):
+                raise gr.Error(f"{tag} SAFE 路径不存在：{p}")
+        out_dir = os.path.join(OUT_DIR, "sar")
+        result = process_sar_pair(
+            pre_path.strip(), post_path.strip(), polarization,
+            out_dir=out_dir, size=int(size), threshold_db=float(threshold_db), progress=prog,
+        )
+        sid = result["id"]
+        zip_path = os.path.join(out_dir, f"{sid}_SAR成果包.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in result["paths"].values():
+                zf.write(p, os.path.basename(p))
+            zf.writestr(f"{sid}_info.json", json.dumps(
+                {"id": sid, "stats": result["stats"], "provenance": result["provenance"]},
+                ensure_ascii=False, indent=2))
+        logs.append(f"成果包：{zip_path}")
+        return result["paths"]["preview"], _sar_stats_html(result), zip_path, "\n".join(logs)
+    except gr.Error:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(f"雷达处理失败：{type(exc).__name__}: {exc}") from exc
+
+
+def _zip_paths(zip_path: str, files: Dict[str, str], extra: Optional[Dict[str, Any]] = None) -> str:
+    import json
+    import zipfile
+
+    os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files.values():
+            if p and os.path.isfile(p):
+                zf.write(p, os.path.basename(p))
+        if extra:
+            zf.writestr("info.json", json.dumps(extra, ensure_ascii=False, indent=2, default=str))
+    return zip_path
+
+
+def _local_optical_pair(sid: str) -> Optional[Tuple[str, str]]:
+    """预设事件若本地已有 data/real/{id}_pre/post.tif，直接用，免再下载。"""
+    real = os.path.join(ROOT, "data", "real")
+    pre = os.path.join(real, f"{sid}_pre.tif")
+    post = os.path.join(real, f"{sid}_post.tif")
+    if os.path.isfile(pre) and os.path.isfile(post):
+        return pre, post
+    return None
+
+
+class _LogTee:
+    """把脚本 print 实时灌进界面日志。"""
+
+    def __init__(self, emit, also) -> None:
+        self._emit = emit
+        self._also = also
+        self._buf = ""
+
+    def write(self, data: str) -> int:
+        if self._also is not None:
+            try:
+                self._also.write(data)
+            except Exception:
+                pass
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                self._emit(line)
+        return len(data)
+
+    def flush(self) -> None:
+        if self._also is not None:
+            try:
+                self._also.flush()
+            except Exception:
+                pass
+
+
+def _as_local_path(upload: Any, typed: Optional[str] = None) -> Optional[str]:
+    raw = (typed or "").strip().strip('"')
+    if raw and os.path.isfile(raw):
+        return raw
+    if upload:
+        path = upload if isinstance(upload, str) else getattr(upload, "name", "")
+        if path and os.path.isfile(str(path)):
+            return str(path)
+    return None
+
+
+def _parse_ymd(value: Any, label: str) -> str:
+    s = str(value or "").strip()[:10]
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        raise gr.Error(f"请填写{label}（YYYY-MM-DD）")
+    try:
+        np.datetime64(s)
+    except Exception as exc:
+        raise gr.Error(f"{label} 不是有效日期：{s}") from exc
+    return s
+
+
+def _slider_pair(before: Any, after: Any) -> Any:
+    if HAS_IMAGE_SLIDER:
+        return (before, after)
+    return after
+
+
+def _imread_rgb(path: str) -> np.ndarray:
+    from PIL import Image
+
+    return np.asarray(Image.open(path).convert("RGB"))
+
+
+def _nearest_preset(lon: float, lat: float, max_deg: float = 0.25) -> Optional[str]:
+    try:
+        events = _preset_events()
+    except Exception:
+        return None
+    best_key = None
+    best_d = max_deg
+    for key, cfg in events.items():
+        elon, elat = cfg["aoi"]
+        dist = ((float(lon) - float(elon)) ** 2 + (float(lat) - float(elat)) ** 2) ** 0.5
+        if dist < best_d:
+            best_d = dist
+            best_key = str(key)
+    return best_key
+
+
+def _fallback_local_optical(lon: float, lat: float) -> Optional[Tuple[str, str, str]]:
+    """下载失败时，用距离最近的本地真实影像把流程跑完。"""
+    try:
+        events = _preset_events()
+    except Exception:
+        events = {}
+    ranked: List[Tuple[float, str]] = []
+    for key, cfg in events.items():
+        pair = _local_optical_pair(key)
+        if not pair:
+            continue
+        elon, elat = cfg["aoi"]
+        dist = ((float(lon) - float(elon)) ** 2 + (float(lat) - float(elat)) ** 2) ** 0.5
+        ranked.append((dist, key))
+    if not ranked:
+        for key in ("poyang2020", "zhuozhou2023"):
+            pair = _local_optical_pair(key)
+            if pair:
+                return pair[0], pair[1], key
+        return None
+    ranked.sort()
+    key = ranked[0][1]
+    pair = _local_optical_pair(key)
+    if not pair:
+        return None
+    return pair[0], pair[1], key
+
+
+def _pipeline_body(
+    lon: Optional[float],
+    lat: Optional[float],
+    pre_start: Optional[str],
+    pre_end: Optional[str],
+    post_start: Optional[str],
+    post_end: Optional[str],
+    win_size: int,
+    prog,
+) -> Tuple[Any, Any, str, str, str]:
+    """地图选点 + 时间范围 → 下载 → 灾前/灾后识别对比。"""
+    import contextlib
+
+    try:
+        lon_v, lat_v = float(lon), float(lat)
+    except (TypeError, ValueError):
+        raise gr.Error("请先在地图上选择地点") from None
+    if not (-180.0 <= lon_v <= 180.0 and -90.0 <= lat_v <= 90.0):
+        raise gr.Error("经纬度超出范围")
+
+    pre0 = _parse_ymd(pre_start, "灾前开始日期")
+    pre1 = _parse_ymd(pre_end, "灾前结束日期")
+    post0 = _parse_ymd(post_start, "灾后开始日期")
+    post1 = _parse_ymd(post_end, "灾后结束日期")
+    if pre0 > pre1:
+        pre0, pre1 = pre1, pre0
+    if post0 > post1:
+        post0, post1 = post1, post0
+    if pre1 > post1:
+        raise gr.Error("灾前时间范围应早于灾后时间范围")
+
+    size = int(win_size or 768)
+    sid = f"custom_{lon_v:.2f}_{lat_v:.2f}_{post0.replace('-', '')}"
+    nearby = _nearest_preset(lon_v, lat_v, max_deg=0.04)
+    cached = _local_optical_pair(nearby) if nearby else None
+    cfg = {
+        "label": f"自定义 {lon_v:.3f},{lat_v:.3f}",
+        "aoi": (lon_v, lat_v),
+        "pre": (pre0, pre1, pre1),
+        "post": (post0, post1, post0),
+        "size": size,
+        "note": "地图选点自动下载",
+    }
+    if nearby:
+        try:
+            cfg["label"] = _preset_events()[nearby].get("label", cfg["label"])
+        except Exception:
+            pass
+        if cached:
+            sid = nearby
+    prog(f"地点 WGS84 ({lon_v:.4f}, {lat_v:.4f})  灾前 {pre0}~{pre1}  灾后 {post0}~{post1}")
+
+    out_dir = os.path.join(OUT_DIR, "pipeline", sid)
+    os.makedirs(out_dir, exist_ok=True)
+    used = None
+    rtc = None
+    pre_path = post_path = None
+
+    if cached:
+        pre_path, post_path = cached
+        used = "optical"
+        prog(f"本地已有邻近事件影像，跳过下载：{os.path.basename(pre_path)} / {os.path.basename(post_path)}")
+    else:
+        prog(f"邻近缓存：{nearby or '无'}")
+
+    if used is None:
+        prog("① 按你选的地点下载 Sentinel-2（公开数据，分块读取，请等 1–3 分钟）…")
+        try:
+            fs = _load_script("fetch_real_samples")
+            tee = _LogTee(prog, getattr(sys, "__stdout__", None))
+            with contextlib.redirect_stdout(tee):
+                entry = fs.fetch_event(
+                    sid, cfg, out_dir, size=size, max_cloud=60.0,
+                    allow_cloudy=True, fast=True, budget_s=None,
+                )
+        except Exception as exc:
+            prog(f"光学下载失败：{type(exc).__name__}: {exc}")
+            entry = None
+        if entry:
+            used = "optical"
+            pre_path = os.path.join(out_dir, entry["pre"])
+            post_path = os.path.join(out_dir, entry["post"])
+            prog("该点光学影像已落地，开始灾前/灾后对比…")
+        else:
+            prog("该点光学影像下载失败。")
+
+    if used is None:
+        raise gr.Error(
+            "这个地点的卫星影像没能下载完成。\n"
+            "请换一个时间范围再试；数据源为 Sentinel-2 公开影像"
+            "（微软 Planetary Computer / AWS 公开桶，自动切换）。"
+        )
+
+    prog("正在识别并对比（NDWI 基线）…")
+    det = FloodDetector(mode="baseline")
+    result = det.compare(pre_path, post_path)
+    bundled = export_bundle(result, out_dir=out_dir, basename=sid)
+    change = result.change or {}
+    slider = _slider_pair(change.get("before_overlay", result.rgb), change.get("after_overlay", result.overlay))
+    preview = compare_figure(result)
+    prog(f"完成。该点成果包 {bundled['zip']}")
+    return slider, preview, stats_html(result), result.summary_text(), bundled["zip"]
+
+
+def run_full_pipeline(
+    lon: Optional[float],
+    lat: Optional[float],
+    pre_start: Optional[str],
+    pre_end: Optional[str],
+    post_start: Optional[str],
+    post_end: Optional[str],
+    win_size: int,
+):
+    """地图选点 → 下载 → 灾前/灾后对比。后台线程跑，日志持续刷新。"""
+    import threading
+    import time
+
+    logs: List[str] = []
+    lock = threading.Lock()
+    box: Dict[str, Any] = {"done": False, "err": None, "final": None}
+
+    def prog(msg: str) -> None:
+        with lock:
+            logs.append(str(msg))
+        try:
+            sys.__stdout__.write(f"[全流程] {msg}\n")
+            sys.__stdout__.flush()
+        except Exception:
+            pass
+
+    def snapshot():
+        with lock:
+            text = "\n".join(logs[-80:]) or "启动中…"
+        final = box.get("final")
+        if final:
+            slider, preview, html, summary, zpath = final
+            return slider, preview, html, summary, zpath, text
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), text
+
+    def work() -> None:
+        try:
+            box["final"] = _pipeline_body(
+                lon, lat, pre_start, pre_end, post_start, post_end, win_size, prog,
+            )
+        except Exception as exc:
+            box["err"] = exc
+            traceback.print_exc()
+            prog(f"失败：{type(exc).__name__}: {exc}")
+        finally:
+            box["done"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+    n_seen = 0
+    last_beat = time.time()
+    yield snapshot()
+    while not box["done"]:
+        time.sleep(0.4)
+        with lock:
+            n = len(logs)
+        now = time.time()
+        if n != n_seen:
+            n_seen = n
+            last_beat = now
+            yield snapshot()
+        elif now - last_beat >= 8:
+            prog("仍在下载/处理，请稍候（网络慢时单景窗口可能要 1–3 分钟）…")
+            last_beat = now
+            yield snapshot()
+
+    err = box["err"]
+    if err is not None:
+        if isinstance(err, gr.Error):
+            raise err
+        raise gr.Error(f"全流程失败：{type(err).__name__}: {err}\n" + "\n".join(logs[-12:])) from err
+    yield snapshot()
+
+
+# --------------------------------------------------------------------------
+# 地图选点（默认高德，免密钥；点选输出 WGS84 供卫星检索）
+# --------------------------------------------------------------------------
+
+
+def _preset_map_points() -> List[Dict[str, Any]]:
+    pts: List[Dict[str, Any]] = []
+    try:
+        for key, cfg in _preset_events().items():
+            lon, lat = cfg["aoi"]
+            pre = cfg.get("pre") or ("", "", "")
+            post = cfg.get("post") or ("", "", "")
+            pts.append({
+                "key": key,
+                "lon": float(lon),
+                "lat": float(lat),
+                "label": cfg.get("label", key),
+                "pre_start": pre[0],
+                "pre_end": pre[1],
+                "post_start": post[0],
+                "post_end": post[1],
+            })
+    except Exception:
+        pass
+    return pts
+
+
+def _map_engine_js() -> str:
+    """无外部 Leaflet：用高德/智图瓦片在页面内画地图（国内可访问）。"""
+    import json
+
+    presets = json.dumps(_preset_map_points(), ensure_ascii=False)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heye_map.js")
+    with open(path, encoding="utf-8") as fh:
+        body = fh.read()
+    return f"window.__HEYE_PRESETS = {presets};\n{body}"
+
+
+def _map_html(lon: float = 116.30, lat: float = 29.15, zoom: int = 7) -> str:
+    """占位：真实地图由 js_on_load 绘制，避免 iframe/CDN 被拦截。"""
+    _ = (lon, lat, zoom)
+    return '<div id="heye-map" class="heye-map"></div>'
+
+
+def _dates_from_preset(cfg: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    pre = cfg.get("pre") or ("2020-05-08", "2020-06-05", "2020-05-20")
+    post = cfg.get("post") or ("2020-07-10", "2020-07-30", "2020-07-13")
+    return str(pre[0]), str(pre[1]), str(post[0]), str(post[1])
+
+
+def geocode_place(query: str):
+    """先匹配内置事件名，再尝试地名检索。"""
+    import json
+    import urllib.parse
+    import urllib.request
+
+    q = (query or "").strip()
+    if not q:
+        raise gr.Error("请输入地名后再点「定位此地」")
+    try:
+        events = _preset_events()
+    except Exception:
+        events = {}
+    qn = q.lower()
+    for key, cfg in events.items():
+        blob = f"{key} {cfg.get('label', '')}".lower()
+        if qn in blob or key in qn:
+            lon, lat = cfg["aoi"]
+            a, b, c, d = _dates_from_preset(cfg)
+            return (
+                float(lon), float(lat),
+                f"已定位：{cfg.get('label', key)}，时间范围已填入",
+                a, b, c, d,
+            )
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": q, "format": "json", "limit": 1}
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "HuiyanShizai/0.2 (flood-eyes mapping)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        raise gr.Error("地名检索不可用，请直接在地图上点击选点") from None
+    if not data:
+        raise gr.Error(f"找不到地点：{q}。请在地图上点击。")
+    lon = float(data[0]["lon"])
+    lat = float(data[0]["lat"])
+    label = data[0].get("display_name") or q
+    return (
+        lon, lat,
+        f"已定位：{label}",
+        gr.update(), gr.update(), gr.update(), gr.update(),
+    )
+
+
+def apply_map_point(
+    lon: Optional[float],
+    lat: Optional[float],
+    pre_start: Optional[str],
+    pre_end: Optional[str],
+    post_start: Optional[str],
+    post_end: Optional[str],
+):
+    if lon is None or lat is None:
+        raise gr.Error("请先在地图上点一下")
+    lon_v, lat_v = float(lon), float(lat)
+    if not (-180.0 <= lon_v <= 180.0 and -90.0 <= lat_v <= 90.0):
+        raise gr.Error("地图坐标无效")
+    note = f"已写入 {lon_v:.4f}, {lat_v:.4f}，可改时间范围后开始分析"
+    nearby = _nearest_preset(lon_v, lat_v)
+    if nearby:
+        try:
+            note = f"已写入 {_preset_events()[nearby].get('label', nearby)}  {lon_v:.4f}, {lat_v:.4f}"
+        except Exception:
+            pass
+    return lon_v, lat_v, note, pre_start, pre_end, post_start, post_end
+
+
+# --------------------------------------------------------------------------
+# 界面
+# --------------------------------------------------------------------------
+
+
+def build_ui(baseline_only: bool = False) -> gr.Blocks:
+    _ = baseline_only
+    with gr.Blocks(**_blocks_kwargs("慧眼识灾 · 遥感 AI 洪水识别系统")) as demo:
+        gr.HTML(HEADER)
+        gr.Markdown(
+            "在地图上点选任意地点（或搜索地名），填好灾前/灾后时间范围后一键分析。"
+            "系统按所选地点下载 Sentinel-2 公开影像并对比，首次下载约 1–3 分钟，同一地点再次分析走本地缓存。"
+        )
+
+        # —— 第一区（横向）：地图选点 ＋ 参数设置 ——
+        with gr.Row():
+            with gr.Column(scale=7, min_width=420, elem_classes=["heye-map-col"]):
+                map_view = gr.HTML(
+                    value=_map_html(),
+                    elem_id="heye-map-host",
+                    min_height=420,
+                    js_on_load=_map_engine_js(),
+                )
+            with gr.Column(scale=5, min_width=340, elem_classes=["heye-panel"]):
+                gr.HTML('<div class="heye-sec-title">① 选点与时间</div>')
+                with gr.Row():
+                    place_q = gr.Textbox(
+                        label="搜索地名",
+                        placeholder="例如：鄱阳湖、涿州、洞庭湖",
+                        scale=7,
+                        elem_classes=["heye-mini"],
+                    )
+                    search_btn = gr.Button("定位此地", scale=3, min_width=92)
+                with gr.Row():
+                    lon_in = gr.Number(label="经度（WGS84）", value=116.30, precision=4, scale=4)
+                    lat_in = gr.Number(label="纬度（WGS84）", value=29.15, precision=4, scale=4)
+                    pick_btn = gr.Button("使用此地点", scale=3, min_width=104)
+                with gr.Row():
+                    pre_start = gr.Textbox(label="灾前 · 开始", value="2020-05-08", placeholder="YYYY-MM-DD", elem_classes=["heye-mini"])
+                    pre_end = gr.Textbox(label="灾前 · 结束", value="2020-06-05", placeholder="YYYY-MM-DD", elem_classes=["heye-mini"])
+                with gr.Row():
+                    post_start = gr.Textbox(label="灾后 · 开始", value="2020-07-10", placeholder="YYYY-MM-DD", elem_classes=["heye-mini"])
+                    post_end = gr.Textbox(label="灾后 · 结束", value="2020-07-30", placeholder="YYYY-MM-DD", elem_classes=["heye-mini"])
+                with gr.Row():
+                    win_size = gr.Dropdown(
+                        [512, 768, 1024],
+                        value=512,
+                        label="窗口边长（像元，10 m → 5/8/10 km）",
+                        scale=5,
+                    )
+                    go_btn = gr.Button("开始分析", variant="primary", size="lg", scale=5, elem_classes=["heye-primary"])
+                search_status = gr.Markdown("右侧地图点击选点。坐标转为 WGS84，供卫星检索。")
+
+        # —— 第二区（横向）：灾前↔灾后 ＋ 变化检测 ——
+        with gr.Row():
+            with gr.Column(scale=6, min_width=360, elem_classes=["heye-panel"]):
+                gr.HTML('<div class="heye-sec-title">② 灾前 ↔ 灾后对比</div>')
+                slider = image_slider_component("拖动滑块：灾前 ↔ 灾后")
+            with gr.Column(scale=6, min_width=360, elem_classes=["heye-panel"]):
+                gr.HTML('<div class="heye-sec-title">③ 变化检测图</div>')
+                change_img = gr.Image(label="变化检测图", height=346, show_label=False)
+                gr.HTML(
+                    '<div class="heye-legend">'
+                    '<span class="heye-tag" style="background:rgba(255,59,48,.16);color:#ff3b30">红 · 新增淹没</span>'
+                    '<span class="heye-tag" style="background:rgba(52,199,89,.16);color:#248a3d">绿 · 退水</span>'
+                    '<span class="heye-tag info">青 · 持续水体</span></div>'
+                )
+
+        # —— 第三区（横向）：统计 ＋ 结论 ＋ 成果包 ——
+        with gr.Row():
+            with gr.Column(scale=6, min_width=360, elem_classes=["heye-panel"]):
+                pipe_stats = gr.HTML(value=empty_stats_html("分析完成后显示灾前/灾后对比"), label="统计面板")
+            with gr.Column(scale=3, min_width=240, elem_classes=["heye-panel"]):
+                pipe_summary = _textbox(label="对比结论", lines=7, show_copy_button=True)
+            with gr.Column(scale=3, min_width=220, elem_classes=["heye-panel"]):
+                pipe_zip = gr.File(label="成果包", interactive=False)
+
+        # —— 日志（通栏，可折叠）——
+        with gr.Accordion("流程日志（下载/识别进度）", open=True, elem_classes=["heye-log-acc"]):
+            pipe_log = _textbox(label="", lines=6, show_copy_button=True, elem_classes=["heye-log"], container=False)
+
+        _MAP_JS = (
+            "(lon, lat, a, b, c, d) => ["
+            "window._heyeLon ?? lon, window._heyeLat ?? lat, "
+            "window._heyePreStart ?? a, window._heyePreEnd ?? b, "
+            "window._heyePostStart ?? c, window._heyePostEnd ?? d]"
+        )
+        _GO_JS = (
+            "(lon, lat, a, b, c, d, w) => ["
+            "window._heyeLon ?? lon, window._heyeLat ?? lat, "
+            "window._heyePreStart ?? a, window._heyePreEnd ?? b, "
+            "window._heyePostStart ?? c, window._heyePostEnd ?? d, w]"
+        )
+        search_btn.click(
+            geocode_place,
+            inputs=place_q,
+            outputs=[lon_in, lat_in, search_status, pre_start, pre_end, post_start, post_end],
+        )
+        place_q.submit(
+            geocode_place,
+            inputs=place_q,
+            outputs=[lon_in, lat_in, search_status, pre_start, pre_end, post_start, post_end],
+        )
+        pick_btn.click(
+            apply_map_point,
+            inputs=[lon_in, lat_in, pre_start, pre_end, post_start, post_end],
+            outputs=[lon_in, lat_in, search_status, pre_start, pre_end, post_start, post_end],
+            js=_MAP_JS,
+        )
+        lon_in.change(
+            lambda lon, lat: None,
+            inputs=[lon_in, lat_in],
+            js="(lon, lat) => { if (window._heyeFly && lon != null && lat != null) window._heyeFly(Number(lat), Number(lon)); }",
+        )
+        go_btn.click(
+            run_full_pipeline,
+            inputs=[lon_in, lat_in, pre_start, pre_end, post_start, post_end, win_size],
+            outputs=[slider, change_img, pipe_stats, pipe_summary, pipe_zip, pipe_log],
+            js=_GO_JS,
+        )
+        gr.HTML(FOOTER)
+    return demo
+
+def stats_html_preview(sample_id: Optional[str]) -> str:
+    """未识别时先展示参考信息：合成样本给真值，真实样本给数据溯源。"""
+    if not sample_id:
+        return empty_stats_html()
+    try:
+        s = next(x for x in load_manifest() if x["id"] == sample_id)
+    except Exception:
+        return empty_stats_html()
+    if s.get("_real"):
+        prov = s.get("provenance", {})
+        rows = [
+            ("灾前景", f"{prov.get('pre_scene', '-')}　{str(prov.get('pre_datetime', ''))[:10]}"),
+            ("灾后景", f"{prov.get('post_scene', '-')}　{str(prov.get('post_datetime', ''))[:10]}"),
+            ("AOI 窗口云量", f"灾前 {prov.get('pre_window_cloud_pct', '-')}%　灾后 {prov.get('post_window_cloud_pct', '-')}%"),
+            ("数据来源", "Sentinel-2 L2A · AWS 公开 COG"),
+            ("许可", "Copernicus Sentinel Data Terms（免费开放）"),
+        ]
+        body = "".join(
+            f'<div class="k" style="margin:6px 0 2px">{k}</div><div style="font-size:13px">{v}</div>'
+            for k, v in rows
+        )
+        return f"""
+<div class="heye-card" style="background:var(--accent-soft);box-shadow:none">
+  <div class="k">数据溯源</div>
+  <div class="v" style="font-size:15px;font-weight:600">真实卫星影像（无逐像元真值）</div>
+  {body}
+  <p style="font-size:12px;color:var(--text-2);margin:10px 0 0">请与灾害报道交叉验证，勿把演示数字当作精度。</p>
+</div>"""
+    return f"""
+<div class="heye-stats">
+  <div class="heye-hero">
+    <div class="t">样本真值参考</div>
+    <div class="n danger">{s.get('flood_area_km2', 0):.2f}<small> km²</small></div>
+  </div>
+  <div class="heye-grid">
+    <div class="heye-card"><div class="k">灾前水体</div><div class="v">{s.get('pre_water_km2', 0):.2f}<small> km²</small></div></div>
+    <div class="heye-card"><div class="k">灾后水体</div><div class="v">{s.get('post_water_km2', 0):.2f}<small> km²</small></div></div>
+  </div>
+</div>"""
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="慧眼识灾 Gradio 演示界面")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--share", action="store_true", help="生成公网分享链接")
+    ap.add_argument("--baseline-only", action="store_true", help="只暴露基线模型（无权重时）")
+    args = ap.parse_args()
+
+    weights = available_weights()
+    print("=" * 68)
+    print(f"慧眼识灾 · 遥感 AI 洪水识别系统（演示版 v{APP_VERSION}）")
+    print(f"示例样本：{len(CHOICES)} 景   |   权重：{len(weights)} 个" + (f" -> {os.path.basename(weights[0])}" if weights else "（将使用 NDWI 基线）"))
+    print(f"访问地址：http://{args.host}:{args.port}")
+    print("=" * 68)
+
+    demo = build_ui(baseline_only=args.baseline_only)
+    demo.queue().launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        show_error=True,
+        inbrowser=False,
+        quiet=False,
+        **_launch_kwargs(),
+    )
+
+
+if __name__ == "__main__":
+    main()

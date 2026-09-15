@@ -1,0 +1,121 @@
+{
+  "note": "合成演示数据，仅用于验证流程，不可用于宣称模型精度。",
+  "pixel_size_m": 10.0,
+  "crs": "EPSG:32650",
+  "bands": [
+    "B2(blue)",
+    "B3(green)",
+    "B4(red)",
+    "B8(nir)"
+  ],
+  "samples": [
+    {
+      "id": "demo01",
+      "pre": "demo01_pre.tif",
+      "post": "demo01_post.tif",
+      "mask": "demo01_mask.png",
+      "pre_mask": "demo01_pre_mask.png",
+      "preview": "demo01_preview.jpg",
+      "size": [
+        640,
+        640
+      ],
+      "pixel_size_m": 10.0,
+      "flood_area_km2": 2.6449000000000003,
+      "post_water_km2": 4.1568000000000005,
+      "pre_water_km2": 1.512,
+      "flood_fraction_pct": 6.457275390625,
+      "description": "合成场景 1：蜿蜒河道 + 低洼区漫滩淹没（10 m 分辨率）"
+    },
+    {
+      "id": "demo02",
+      "pre": "demo02_pre.tif",
+      "post": "demo02_post.tif",
+      "mask": "demo02_mask.png",
+      "pre_mask": "demo02_pre_mask.png",
+      "preview": "demo02_preview.jpg",
+      "size": [
+        640,
+        640
+      ],
+      "pixel_size_m": 10.0,
+      "flood_area_km2": 4.2648,
+      "post_water_km2": 5.9509,
+      "pre_water_km2": 1.6861000000000002,
+      "flood_fraction_pct": 10.412109375,
+      "description": "合成场景 2：蜿蜒河道 + 低洼区漫滩淹没（10 m 分辨率）"
+    },
+    {
+      "id": "demo03",
+      "pre": "demo03_pre.tif",
+      "post": "demo03_post.tif",
+      "mask": "demo03_mask.png",
+      "pre_mask": "demo03_pre_mask.png",
+      "preview": "demo03_preview.jpg",
+      "size": [
+        640,
+        640
+      ],
+      "pixel_size_m": 10.0,
+      "flood_area_km2": 4.0545,
+      "post_water_km2": 6.268400000000001,
+      "pre_water_km2": 2.2139,
+      "flood_fraction_pct": 9.898681640625,
+      "description": "合成场景 3：蜿蜒河道 + 低洼区漫滩淹没（10 m 分辨率）"
+    },
+    {
+      "id": "demo04",
+      "pre": "demo04_pre.tif",
+      "post": "demo04_post.tif",
+      "mask": "demo04_mask.png",
+      "pre_mask": "demo04_pre_mask.png",
+      "preview": "demo04_preview.jpg",
+      "size": [
+        640,
+        640
+      ],
+      "pixel_size_m": 10.0,
+      "flood_area_km2": 5.857200000000001,
+      "post_water_km2": 7.8279000000000005,
+      "pre_water_km2": 1.9708,
+      "flood_fraction_pct": 14.2998046875,
+      "description": "合成场景 4：蜿蜒河道 + 低洼区漫滩淹没（10 m 分辨率）"
+    },
+    {
+      "id": "demo05",
+      "pre": "demo05_pre.tif",
+      "post": "demo05_post.tif",
+      "mask": "demo05_mask.png",
+      "pre_mask": "demo05_pre_mask.png",
+      "preview": "demo05_preview.jpg",
+      "size": [
+        640,
+        640
+      ],
+      "pixel_size_m": 10.0,
+      "flood_area_km2": 4.9697000000000005,
+      "post_water_km2": 6.3075,
+      "pre_water_km2": 1.3378,
+      "flood_fraction_pct": 12.133056640625,
+      "description": "合成场景 5：蜿蜒河道 + 低洼区漫滩淹没（10 m 分辨率）"
+    },
+    {
+      "id": "demo06",
+      "pre": "demo06_pre.tif",
+      "post": "demo06_post.tif",
+      "mask": "demo06_mask.png",
+      "pre_mask": "demo06_pre_mask.png",
+      "preview": "demo06_preview.jpg",
+      "size": [
+        640,
+        640
+      ],
+      "pixel_size_m": 10.0,
+      "flood_area_km2": 5.361800000000001,
+      "post_water_km2": 6.6644000000000005,
+      "pre_water_km2": 1.3027,
+      "flood_fraction_pct": 13.09033203125,
+      "description": "合成场景 6：蜿蜒河道 + 低洼区漫滩淹没（10 m 分辨率）"
+    }
+  ]
+}

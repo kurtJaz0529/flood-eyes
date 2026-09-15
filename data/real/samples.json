@@ -1,0 +1,100 @@
+{
+  "samples": [
+    {
+      "id": "zhuozhou2023",
+      "label": "2023·河北涿州暴雨洪涝",
+      "description": "2023-07-29~08-01 京津冀特大暴雨，涿州城区及周边大面积进水",
+      "aoi": [
+        115.97,
+        39.49
+      ],
+      "size": [
+        1280,
+        1280
+      ],
+      "pixel_size_m": 10.0,
+      "pre": "zhuozhou2023_pre.tif",
+      "post": "zhuozhou2023_post.tif",
+      "preview": "zhuozhou2023_preview.jpg",
+      "pre_scl": "zhuozhou2023_pre_scl.png",
+      "post_scl": "zhuozhou2023_post_scl.png",
+      "provenance": {
+        "pre_scene": "S2A_50SMJ_20230716_0_L2A",
+        "pre_datetime": "2023-07-16T03:17:03.370000Z",
+        "pre_scene_cloud_pct": 0.0,
+        "pre_window_cloud_pct": 0.0,
+        "pre_window_water_pct": 0.3,
+        "pre_window_shift_km": 0.0,
+        "pre_epsg": 32650,
+        "pre_boa_offset_applied": true,
+        "pre_offset_basis": "STAC标记(boa_offset_applied=True)",
+        "post_scene": "S2A_50SMJ_20230815_0_L2A",
+        "post_datetime": "2023-08-15T03:17:04.110000Z",
+        "post_scene_cloud_pct": 2.8,
+        "post_window_cloud_pct": 0.0,
+        "post_window_water_pct": 1.1,
+        "post_window_shift_km": 0.0,
+        "post_epsg": 32650,
+        "post_boa_offset_applied": true,
+        "post_offset_basis": "STAC标记(boa_offset_applied=True)",
+        "source": "Sentinel-2 L2A (COG on AWS) via Element84 Earth Search STAC",
+        "stac_api": "https://earth-search.aws.element84.com/v1/search",
+        "license": "Copernicus Sentinel Data Terms and Conditions (free and open)",
+        "fetch_time": "2026-09-08 21:54:15",
+        "note": "反射率已按 STAC 元数据应用 scale/offset，落盘为 反射率×10000 的 uint16"
+      }
+    },
+    {
+      "id": "poyang2020",
+      "label": "2020·江西鄱阳湖特大洪水",
+      "description": "2020-07 长江流域特大洪水，鄱阳湖水域面积较汛前扩大约 3 倍",
+      "aoi": [
+        116.3,
+        29.15
+      ],
+      "size": [
+        1280,
+        1280
+      ],
+      "pixel_size_m": 10.0,
+      "pre": "poyang2020_pre.tif",
+      "post": "poyang2020_post.tif",
+      "preview": "poyang2020_preview.jpg",
+      "pre_scl": "poyang2020_pre_scl.png",
+      "post_scl": "poyang2020_post_scl.png",
+      "provenance": {
+        "pre_scene": "S2A_50RMT_20200519_1_L2A",
+        "pre_datetime": "2020-05-19T03:09:46.912000Z",
+        "pre_scene_cloud_pct": 2.6,
+        "pre_window_cloud_pct": 4.3,
+        "pre_window_water_pct": 50.2,
+        "pre_window_shift_km": 0.0,
+        "pre_epsg": 32650,
+        "pre_boa_offset_applied": true,
+        "pre_offset_basis": "STAC标记(boa_offset_applied=True)",
+        "post_scene": "S2A_50RMT_20200715_0_L2A",
+        "post_datetime": "2020-07-15T02:59:50.513000Z",
+        "post_scene_cloud_pct": 54.2,
+        "post_window_cloud_pct": 0.1,
+        "post_window_water_pct": 93.4,
+        "post_window_shift_km": 0.0,
+        "post_epsg": 32650,
+        "post_boa_offset_applied": false,
+        "post_offset_basis": "无偏移(baseline<04.00)",
+        "source": "Sentinel-2 L2A (COG on AWS) via Element84 Earth Search STAC",
+        "stac_api": "https://earth-search.aws.element84.com/v1/search",
+        "license": "Copernicus Sentinel Data Terms and Conditions (free and open)",
+        "fetch_time": "2026-09-08 21:55:22",
+        "note": "反射率已按 STAC 元数据应用 scale/offset，落盘为 反射率×10000 的 uint16"
+      }
+    }
+  ],
+  "note": "真实 Sentinel-2 L2A 影像（AWS 公开 COG，经 Element84 Earth Search 检索），用于演示与验证；不含人工标注掩膜。",
+  "pixel_size_m": 10.0,
+  "bands": [
+    "B2(blue)",
+    "B3(green)",
+    "B4(red)",
+    "B8(nir)"
+  ]
+}

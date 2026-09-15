@@ -1,0 +1,44 @@
+{
+  "note": "Sentinel-1 RTC 处理成果（σ0 dB）",
+  "samples": [
+    {
+      "id": "nepal2026_aoi2",
+      "label": "Sentinel-1 RTC 洪水提取（VV）",
+      "pixel_size_m": 10.0,
+      "pre": "nepal2026_aoi2_pre_vv.tif",
+      "post": "nepal2026_aoi2_post_vv.tif",
+      "preview": "nepal2026_aoi2_preview.jpg",
+      "change": "nepal2026_aoi2_change.png",
+      "stats": {
+        "pre_water_km2": 18.8691,
+        "post_water_km2": 22.1635,
+        "new_water_km2": 1.6606,
+        "receded_km2": 1.0537,
+        "persistent_km2": 17.8154,
+        "window_km2": 235.9296,
+        "threshold_db": -16.0,
+        "polarization": "VV"
+      },
+      "provenance": {
+        "sensor": "Sentinel-1 RTC (Planetary Computer, 地形校正)",
+        "pre_scene": "S1D_IW_GRDH_1SDV_20260816T122141_20260816T122206_004151_007980_rtc",
+        "post_scene": "S1D_IW_GRDH_1SDV_20260828T122141_20260828T122206_004326_007FA4_rtc",
+        "pre_datetime": "2026-08-16T12:21:53.557589Z",
+        "post_datetime": "2026-08-28T12:21:54.261291Z",
+        "polarization": "VV",
+        "threshold_db": -16.0,
+        "drop_db": 3.5,
+        "aoi_lonlat": [
+          85.4651,
+          29.2551
+        ],
+        "window": [
+          1536,
+          1536
+        ],
+        "source": "Microsoft Planetary Computer / sentinel-1-rtc",
+        "license": "Copernicus Sentinel Data Terms (free and open)"
+      }
+    }
+  ]
+}

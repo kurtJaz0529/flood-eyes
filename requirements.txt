@@ -1,0 +1,35 @@
+# 慧眼识灾 · 依赖清单
+# =====================
+# 安装：
+#     pip install -r requirements.txt
+#
+# 注意 PyTorch 的安装方式：
+#   · 只有 CPU（演示/无显卡笔记本）：
+#         pip install torch torchvision
+#   · 有 NVIDIA 显卡（训练推荐，CUDA 12.x 示例）：
+#         pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   · 国内网络较慢时加镜像：
+#         pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ---- 核心运行（基线 + 界面 + 导出）----
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21          # Otsu 阈值（有纯 numpy 兜底，可不装）
+opencv-python-headless>=4.8 # 形态学、连通域、轮廓（有 scipy 兜底）
+rasterio>=1.3               # 读写带地理坐标的 GeoTIFF
+pillow>=10.0
+gradio>=4.44                # Web 演示界面
+reportlab>=4.0              # 中文 PDF 简报
+
+# ---- 深度模型（可选，装不上也能用基线跑）----
+torch>=2.0
+torchvision>=0.15
+segmentation-models-pytorch>=0.3.4  # U-Net + ImageNet 预训练骨干
+
+# ---- 训练与出图 ----
+matplotlib>=3.7
+pandas>=2.0
+tqdm>=4.66
+
+# ---- 数据准备（可选）----
+# requests>=2.31            # 下载 Sen1Floods11

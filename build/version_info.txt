@@ -1,0 +1,35 @@
+# Windows 版本信息（PyInstaller --version-file 使用）
+# 说明：这些信息会出现在 exe 的"属性 -> 详细信息"里，也是软件著作权登记的常用佐证。
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 2, 0, 0),
+    prodvers=(0, 2, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'080404B0',
+          [
+            StringStruct(u'CompanyName', u'慧眼识灾团队'),
+            StringStruct(u'FileDescription', u'慧眼识灾 · 基于深度学习的遥感影像洪水淹没范围智能识别系统'),
+            StringStruct(u'FileVersion', u'0.2.0.0'),
+            StringStruct(u'InternalName', u'flood-eyes'),
+            StringStruct(u'LegalCopyright', u'Copyright (C) 2026 慧眼识灾团队'),
+            StringStruct(u'OriginalFilename', u'慧眼识灾.exe'),
+            StringStruct(u'ProductName', u'慧眼识灾'),
+            StringStruct(u'ProductVersion', u'0.2.0.0'),
+            StringStruct(u'Comments', u'Sentinel-2 L2A / NDWI+Otsu 基线 / U-Net 语义分割')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
+  ]
+)

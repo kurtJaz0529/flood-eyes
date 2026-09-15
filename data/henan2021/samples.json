@@ -1,0 +1,46 @@
+{
+  "note": "Sentinel-1 SAR 处理成果（σ0 dB）",
+  "samples": [
+    {
+      "id": "henan2021",
+      "label": "Sentinel-1 SAR 洪水提取（VV）",
+      "pixel_size_m": 10.0,
+      "pre": "henan2021_pre_vv.tif",
+      "post": "henan2021_post_vv.tif",
+      "preview": "henan2021_preview.jpg",
+      "change": "henan2021_change.png",
+      "stats": {
+        "pre_water_km2": 1.6148,
+        "post_water_km2": 18.9843,
+        "new_water_km2": 17.0061,
+        "receded_km2": 0.3796,
+        "persistent_km2": 1.2352,
+        "window_km2": 1677.7216,
+        "threshold_db": -16.0,
+        "polarization": "VV"
+      },
+      "provenance": {
+        "sensor": "Sentinel-1 IW GRD",
+        "pre_scene": "S1A_IW_GRDH_1SDV_20210715T102036_20210715T102101_038787_04939F_4DA0",
+        "post_scene": "S1A_IW_GRDH_1SDV_20210727T102036_20210727T102101_038962_0498E1_3015",
+        "polarization": "VV",
+        "threshold_db": -16.0,
+        "drop_db": 3.0,
+        "aoi_source": "auto",
+        "aoi_lonlat": [
+          114.16076,
+          34.47863
+        ],
+        "window": [
+          4096,
+          4096
+        ],
+        "gcp_residual_m": {
+          "pre": 90.6,
+          "post": 90.6
+        },
+        "note": "σ0(dB) 存为 int16（×100）；水体 = 低回波 + 相对变暗"
+      }
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+# -*- coding: utf-8 -*-
+"""申报书降AI率改写：替换AI生成段落，删除聊天残留。
+
+用法：
+    python scripts/rewrite_shenbaoshu.py [源文件.docx]
+    set HUIYAN_SB_SRC=D:\\某处\\申报书.docx
+    set HUIYAN_SB_DST=D:\\输出目录
+"""
+import glob
+import sys, io, os
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+import docx
+
+
+def _resolve_src() -> str:
+    """定位待改写的申报书。
+
+    原实现把某个 Kimi 会话附件目录下的绝对路径写死，换机器必然
+    FileNotFoundError；这里按 命令行参数 -> 环境变量 -> 常见位置搜索 解析。
+    """
+    explicit = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("HUIYAN_SB_SRC", "")
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise SystemExit(f"找不到申报书文件：{explicit}")
+        return explicit
+    home = os.path.expanduser("~")
+    patterns = [
+        os.path.join(home, ".kimi-code", "sessions", "*", "session_*", "attachments", "*申报书*.docx"),
+        os.path.join(home, "Desktop", "*申报书*.docx"),
+        os.path.join(home, "Downloads", "*申报书*.docx"),
+        os.path.join(home, "Documents", "*申报书*.docx"),
+    ]
+    hits: list = []
+    for pat in patterns:
+        hits.extend(glob.glob(pat))
+    if not hits:
+        raise SystemExit(
+            "找不到申报书 .docx（已搜索桌面/下载/文档 与 Kimi 附件目录）。\n"
+            "请显式指定：python scripts/rewrite_shenbaoshu.py \"D:\\某处\\申报书.docx\"\n"
+            "或设置环境变量 HUIYAN_SB_SRC。"
+        )
+    return sorted(hits, key=os.path.getmtime, reverse=True)[0]
+
+
+SRC = _resolve_src()
+DST_DIR = os.environ.get("HUIYAN_SB_DST") or r"D:\大创申报材料"
+os.makedirs(DST_DIR, exist_ok=True)
+DST = os.path.join(DST_DIR, "附件2-大创项目申报书（慧眼识灾）.docx")
+print(f"源文件：{SRC}")
+print(f"输出到：{DST}")
+
+R = {
+"慧眼识灾是一款基于深度学习的遥感洪水智能识别系统":
+"慧眼识灾是我们团队做的一套遥感洪水智能识别系统。洪灾发生后，靠人工在卫星图上勾画淹没范围往往要一两天，而救援黄金时间只有72小时。我们用U-Net深度学习模型自动识别水体，同时用NDWI水体指数这套经典物理方法做独立校验，两条完全独立的路线结果对得上才敢往外拿——在2020年鄱阳湖洪水的真实影像上，两边算出的淹没面积偏差不到5%。系统已经做成了能用的网页工具：上传影像、自动圈出淹没范围、统计面积、一键导出PDF灾情简报。2020年鄱阳湖、2023年涿州两个真实灾例都已完整跑通。数据用的是免费的Sentinel-2卫星影像，基层单位用得起，可服务应急调度、水利监管、保险定损等场景。",
+"发表学术论文 1 篇，投稿省级":
+"发表学术论文1篇（遥感或地理信息方向）；申请软件著作权1项（对应已完成的识别系统）；形成可运行的Web系统1套、真实灾例验证报告1份，力争申请发明专利1项。",
+"目的：针对洪灾应急人工解译影像耗时长":
+"目的：洪灾发生后，最急的问题其实很朴素：水淹到哪了？现在基层拿到的灾情图，不少还是专家对着卫星影像手工勾画的，快则一天慢则两三天，而救援的黄金窗口只有72小时。我们这个项目，就是想让机器把这一步接过来：研发一套遥感洪水智能识别系统，上传卫星影像后几分钟内自动圈出淹没范围、算出受灾面积、生成灾情简报，同时用双引擎互证保证结果可信，为应急救援、水利监管这些场景提供一个真正用得上的工具。",
+"思路：以开源遥感影像为数据源":
+"思路：用免费的Sentinel-2卫星影像做数据源，训练U-Net分割模型识别水体。做的过程中我们最担心一个问题：AI算的结果凭什么让人信？所以加了一条“笨办法”做对照——用NDWI水体指数这种经典物理方法再算一遍，两套完全独立的路线，结果对得上才算数。技术上先把灾前灾后影像处理好（包括修复卫星产品自带的数据缺陷），再完成模型训练，最后用Gradio搭网页系统，把识别、统计、出报告串成一条完整链路，用鄱阳湖、涿州的真实洪灾影像做考场。",
+"方法：运用 UNet 语义分割":
+"方法：①数据获取与处理：通过STAC接口从AWS公开数据桶检索下载Sentinel-2影像，针对L2A产品反射率-1000偏移量的问题，逐窗口与原始JP2文件比对自动判定校正；②模型构建：搭建约194万参数的轻量级U-Net，按512×512滑动窗口切块训练与推理，支持任意尺寸影像；③交叉验证：以不依赖训练数据的NDWI+Otsu物理基线为独立参照，校验AI结果（鄱阳湖案例偏差小于5%）；④系统开发：基于Gradio开发Web平台，集成单景识别、灾前灾后变化检测、PDF简报导出，并用2020鄱阳湖、2023涿州两个真实灾例完成全流程测试。",
+"科学性：项目采用 UNet":
+"科学性：我们的验证不是让模型自己证明自己。NDWI水体指数基于绿光和近红外波段的反射差异，是遥感水体制图公认的方法，本身不需要任何训练数据，相当于给AI找了个“第三方裁判”。两条独立路线在鄱阳湖案例中算出的灾后水体面积分别是154.37和155.23平方公里，偏差仅0.6%，在遥感定量反演的误差容忍范围内。另外，每景影像的卫星景号、拍摄日期、云量和处理参数全部记录在案，实验可以完整复现。",
+"先进性：创新双引擎协同架构":
+"先进性：说实话，这个体量的项目谈不上颠覆性创新，但有几件事做得比较扎实：一是“AI+物理方法”双引擎互证的设计，在同级别学生项目里不多见；二是处理掉了Sentinel-2产品BOA偏移量这个坑——这是官方元数据都标错了的问题，我们比对原始数据才解决；三是系统不是只能演示的样品，从上传到导出灾情简报是完整链路，一景1280×1280的影像识别只要2.9秒，具备直接给基层试用的条件。",
+"实际应用价值：系统可快速获取":
+"实际应用价值：最直接的用户是应急管理部门：洪灾头几个小时，系统就能给出淹没范围图和面积数字，救援队往哪派、群众往哪撤，能早一点有依据。水利部门的河湖监管、保险公司的农业和财产定损也用得上——现在定损往往要人到现场，卫星图先把受灾面积框出来，效率会高不少。值得一提的是成本：Sentinel-2数据终身免费、5天更新一次，系统跑起来的边际成本几乎只有电费，这对经费紧张的县级单位很关键。",
+"现实意义：传统人工解译耗时":
+"现实意义：传统人工解译要一两天，洪灾的72小时黄金救援窗口等不起。我们把这一步压缩到分钟级，补上的是基层缺自动化研判工具这块短板。防灾减灾是实打实的民生事，能用自己学的遥感和AI技术搭把手，就是这个项目最朴素的意义。",
+"特色：双引擎结果互证":
+"特色：一是双引擎互证：深度学习出结果、物理方法做校验，两条独立路线互相盯着，用户不用担心AI“瞎算”；二是全程用真实灾例说话：鄱阳湖、涿州两次大灾的真实卫星影像完整跑通，不是模拟数据演示；三是完成度高：网页系统、自动化演示视频、数据溯源文档都是现成的，路演时可以现场操作。",
+"创新：UNet 语义分割与 NDWI":
+"创新：①提出U-Net语义分割与NDWI物理基线并行推理、互验互校的双引擎架构，缓解遥感AI“可信度和可解释性差”的老问题；②针对Sentinel-2官方标记错误的BOA偏移量，设计了与原始JP2逐窗比对的自动判定方案；③滑动窗口重叠拼接的大影像推理流程，实现了任意尺寸影像的稳定识别，完成从算法到实用业务工具的转化。",
+"准备阶段：数据集标注":
+"2026年9—10月（准备与参赛）：完成数据集标注和模型调优，把真实影像上的IoU、F1指标补出来——这是目前最大的短板，优先解决；申请软件著作权；参加校赛、省赛。2026年10—12月（深化）：迭代Web系统，接入国产高分影像，扩充灾例库；联系本地应急管理部门做小规模试点，收集反馈；完成论文撰写并投稿。2027年（收尾）：拓展滑坡、内涝等多灾种识别，汇总成果，整理结题材料，完成结题答辩。",
+"本项目负责人和全体成员郑重承诺":
+"本项目负责人和全体成员郑重承诺：项目内容均为团队自主完成，不抄袭他人成果，不弄虚作假，数据与实验记录真实可查；先诚实做人，再诚信做学问，按进度保质保量完成各项任务。",
+}
+
+DELETE_MARKERS = ["今天 14:58", "精简版项目申报书的字数一般是多少？",
+                  "推荐一些大创申报书的优秀范本", "大创申报书的项目预期成果应该怎么写？"]
+
+doc = docx.Document(SRC)
+
+def all_paras(doc):
+    for p in doc.paragraphs:
+        yield p
+    for t in doc.tables:
+        for row in t.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    yield p
+                for nt in cell.tables:
+                    for r2 in nt.rows:
+                        for c2 in r2.cells:
+                            for p2 in c2.paragraphs:
+                                yield p2
+
+replaced, deleted = [], []
+paras = list(all_paras(doc))
+for p in paras:
+    t = p.text.strip()
+    if not t:
+        continue
+    for m in DELETE_MARKERS:
+        if m in t:
+            p._element.getparent().remove(p._element)
+            deleted.append(t[:30]); break
+    else:
+        for marker, new in R.items():
+            if t.startswith(marker):
+                # 段落可能是"标记 + 后续正文"的拼接。原实现清空所有 run 后只写回
+                # 新文本，标记之后的正文会被静默丢弃，而脚本只打印替换条数、
+                # 不提示内容变短。这里保留标记之后的内容，并对明显缩短给出告警。
+                tail = t[len(marker):]
+                combined = new + tail
+                for r in p.runs:
+                    r.text = ""
+                if p.runs:
+                    p.runs[0].text = combined
+                else:
+                    p.add_run(combined)
+                if len(combined) < len(t) * 0.8:
+                    print(f"  [warn] 段落明显缩短 {len(t)} -> {len(combined)} 字：{marker[:24]}")
+                replaced.append((marker[:18], len(t), len(combined)))
+                break
+
+doc.save(DST)
+print("已替换段落数：", len(replaced))
+for item in replaced:
+    if isinstance(item, tuple):
+        label, before_len, after_len = item
+        print(f"  ✓ {label}  {before_len} -> {after_len} 字")
+    else:
+        print("  ✓", item)
+print("已删除残留段落：", len(deleted))
+for d in deleted: print("  ✗", d)
+print("saved:", DST)

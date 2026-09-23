@@ -1,0 +1,44 @@
+{
+  "note": "Sentinel-1 RTC 处理成果（σ0 dB）",
+  "samples": [
+    {
+      "id": "nepal_rasuwa",
+      "label": "Sentinel-1 RTC 洪水提取（VV）",
+      "pixel_size_m": 10.0,
+      "pre": "nepal_rasuwa_pre_vv.tif",
+      "post": "nepal_rasuwa_post_vv.tif",
+      "preview": "nepal_rasuwa_preview.jpg",
+      "change": "nepal_rasuwa_change.png",
+      "stats": {
+        "pre_water_km2": 1.2939,
+        "post_water_km2": 1.2713,
+        "new_water_km2": 0.046,
+        "receded_km2": 0.2208,
+        "persistent_km2": 1.0731,
+        "window_km2": 235.9296,
+        "threshold_db": -16.0,
+        "polarization": "VV"
+      },
+      "provenance": {
+        "sensor": "Sentinel-1 RTC (Planetary Computer, 地形校正)",
+        "pre_scene": "S1D_IW_GRDH_1SDV_20260816T122141_20260816T122206_004151_007980_rtc",
+        "post_scene": "S1D_IW_GRDH_1SDV_20260828T122141_20260828T122206_004326_007FA4_rtc",
+        "pre_datetime": "2026-08-16T12:21:53.557589Z",
+        "post_datetime": "2026-08-28T12:21:54.261291Z",
+        "polarization": "VV",
+        "threshold_db": -16.0,
+        "drop_db": 2.5,
+        "aoi_lonlat": [
+          85.347,
+          28.163
+        ],
+        "window": [
+          1536,
+          1536
+        ],
+        "source": "Microsoft Planetary Computer / sentinel-1-rtc",
+        "license": "Copernicus Sentinel Data Terms (free and open)"
+      }
+    }
+  ]
+}

@@ -1,0 +1,624 @@
+"""
+慧眼识灾 · 真实卫星影像抓取
+===========================
+
+从 **AWS 公开 Sentinel-2 L2A COG 桶**（经 Element84 Earth Search STAC 检索）
+按洪涝事件抓取"灾前 / 灾后"一对真实影像，直接落成项目可用的 4 波段 GeoTIFF。
+
+为什么用这条链路？
+    · 免注册、免密钥、免下载整个瓦片（HTTP Range 只读 10 km 窗口）
+    · 数据是 Sentinel-2 L2A 大气校正反射率产品，10 m 分辨率
+    · STAC 元数据自带 BOA 偏移量（2022 年后为 -1000），避免 NDWI 被系统性偏移毁掉
+
+用法：
+    python scripts/fetch_real_samples.py --list
+    python scripts/fetch_real_samples.py --event dongting2024
+    python scripts/fetch_real_samples.py --event all --size 1280
+    python scripts/fetch_real_samples.py --event zhuozhou2023 --max-cloud 20
+
+产物（data/real/）：
+    {id}_pre.tif / {id}_post.tif   4 波段（B2 蓝 / B3 绿 / B4 红 / B8 近红外），反射率×10000
+    {id}_pre_scl.png / _post_scl.png  场景分类图（水/云/云影/植被/其他）
+    {id}_preview.jpg               灾前 / 灾后 真彩预览
+    samples.json                   含景号、时间、云量、坐标等溯源信息
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    pass
+
+STAC_API = "https://earth-search.aws.element84.com/v1/search"
+COLLECTION = "sentinel-2-l2a"
+USER_AGENT = "flood-eyes/0.1 (educational; contact: team)"
+
+# SCL 类别 -> 颜色（用于可视化）
+SCL_COLORS = {
+    0: (0, 0, 0),        # 无数据
+    1: (120, 120, 120),  # 饱和/缺陷
+    2: (60, 60, 60),     # 暗区
+    3: (150, 150, 150),  # 云影
+    4: (60, 150, 60),    # 植被
+    5: (200, 180, 120),  # 裸土
+    6: (30, 90, 200),    # 水体
+    7: (150, 200, 220),  # 未分类
+    8: (235, 235, 235),  # 云（中概率）
+    9: (255, 255, 255),  # 云（高概率）
+    10: (210, 225, 245), # 卷云
+    11: (240, 240, 240), # 雪
+}
+CLOUD_CLASSES = (3, 8, 9, 10)  # 云 + 云影
+
+# --------------------------------------------------------------------------
+# 洪涝事件注册表
+# --------------------------------------------------------------------------
+# pre/post 为 (起, 止, 目标日期)：脚本会在区间内挑"窗口云量最低 + 最接近目标日期"的景
+EVENTS: Dict[str, Dict[str, Any]] = {
+    "dongting2024": {
+        "label": "2024·湖南洞庭湖团洲垸决口",
+        "aoi": (112.66, 29.36),
+        "pre": ("2024-06-01", "2024-06-30", "2024-06-20"),
+        "post": ("2024-07-06", "2024-07-25", "2024-07-08"),
+        "size": 1280,
+        "note": "2024-07-05 17:48 团洲垸决口，垸内约 47 km² 被淹，7 月中旬完成排涝",
+    },
+    "zhuozhou2023": {
+        "label": "2023·河北涿州暴雨洪涝",
+        "aoi": (115.97, 39.49),
+        "pre": ("2023-07-08", "2023-07-28", "2023-07-18"),
+        "post": ("2023-08-01", "2023-08-22", "2023-08-05"),
+        "size": 1280,
+        "note": "2023-07-29~08-01 京津冀特大暴雨，涿州城区及周边大面积进水",
+    },
+    "poyang2020": {
+        "label": "2020·江西鄱阳湖特大洪水",
+        "aoi": (116.30, 29.15),
+        "pre": ("2020-05-08", "2020-06-05", "2020-05-20"),
+        "post": ("2020-07-10", "2020-07-30", "2020-07-13"),
+        "size": 1280,
+        "note": "2020-07 长江流域特大洪水，鄱阳湖水域面积较汛前扩大约 3 倍",
+    },
+    "rasuwa2026": {
+        "label": "2026·尼泊尔拉苏瓦（Rasuwa）山洪 / 赛布鲁贝西",
+        "aoi": (85.347, 28.163),
+        "pre": ("2026-08-08", "2026-08-22", "2026-08-16"),
+        "post": ("2026-08-26", "2026-09-02", "2026-08-28"),
+        "size": 1280,
+        "note": "2026-08-26 Rasuwa 山洪，赛布鲁贝西水电受损（Sentinel Asia EOR / GLIDE FF-2026-000162-NPL）",
+    },
+    "brazil2024": {
+        "label": "2024·巴西南里奥格兰德州（阿雷格里港 / 瓜伊巴湖）",
+        "aoi": (-51.31, -30.02),
+        "pre": ("2024-04-01", "2024-04-20", "2024-04-03"),
+        "post": ("2024-05-06", "2024-05-22", "2024-05-06"),
+        "size": 1280,
+        "note": "2024-05 巴西南部特大洪水，瓜伊巴湖漫溢，阿雷格里港及周边城镇大面积被淹",
+    },
+}
+
+_GDAL_ENV = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+    "GDAL_HTTP_MULTIPLEX": "YES",
+    "GDAL_HTTP_VERSION": "2",
+    "GDAL_HTTP_TIMEOUT": "45",
+    "VSI_CACHE": "TRUE",
+    "VSI_CACHE_SIZE": "33554432",
+}
+
+
+# --------------------------------------------------------------------------
+# STAC
+# --------------------------------------------------------------------------
+
+
+def stac_search(
+    bbox: List[float],
+    datetime_range: str,
+    limit: int = 200,
+    cloud_lt: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """检索 Sentinel-2 L2A 条目。bbox = [minx, miny, maxx, maxy]（经纬度）。"""
+    body: Dict[str, Any] = {
+        "collections": [COLLECTION],
+        "bbox": bbox,
+        "datetime": datetime_range,
+        "limit": limit,
+        "sortby": [{"field": "properties.datetime", "direction": "asc"}],
+    }
+    if cloud_lt is not None:
+        body["query"] = {"eo:cloud_cover": {"lt": cloud_lt}}
+    req = urllib.request.Request(
+        STAC_API,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+    )
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp).get("features", [])
+        except Exception as exc:
+            if attempt == 2:
+                raise
+            print(f"  [retry] STAC 检索失败 {type(exc).__name__}，{2 * (attempt + 1)} 秒后重试")
+            time.sleep(2 * (attempt + 1))
+    return []
+
+
+def point_in_bbox(bbox: List[float], lon: float, lat: float) -> bool:
+    return bbox[0] <= lon <= bbox[2] and bbox[1] <= lat <= bbox[3]
+
+
+# --------------------------------------------------------------------------
+# COG 窗口读取
+# --------------------------------------------------------------------------
+
+
+def _open_vsicurl(href: str):
+    import rasterio
+
+    return rasterio.open("/vsicurl/" + href)
+
+
+def _utm_bounds(src_crs: Any, lon: float, lat: float, half_km: float) -> Tuple[float, float, float, float]:
+    from rasterio.warp import transform as warp_transform
+
+    xs, ys = warp_transform("EPSG:4326", src_crs, [lon], [lat])
+    x, y = float(xs[0]), float(ys[0])
+    half = half_km * 1000.0
+    return x - half, y - half, x + half, y + half
+
+
+def read_window(href: str, crs: Any, bounds: Tuple[float, float, float, float],
+                out_size: Optional[int] = None, dtype: str = "float32") -> Tuple[np.ndarray, Any]:
+    """按地理范围读取 COG 窗口。返回 (2D 数组, 窗口 transform)。"""
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.windows import from_bounds
+
+    with rasterio.Env(**_GDAL_ENV):
+        for attempt in range(3):
+            try:
+                with _open_vsicurl(href) as src:
+                    win = from_bounds(*bounds, transform=src.transform)
+                    if out_size:
+                        arr = src.read(1, window=win, out_shape=(out_size, out_size),
+                                       resampling=Resampling.bilinear).astype(dtype)
+                    else:
+                        arr = src.read(1, window=win).astype(dtype)
+                    return arr, src.window_transform(win)
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                print(f"    [retry] 读取失败 {type(exc).__name__}，{2 * (attempt + 1)} 秒后重试")
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError("unreachable")
+
+
+def find_valid_center(
+    item: Dict[str, Any],
+    lon: float,
+    lat: float,
+    max_shift_km: float = 4.0,
+) -> Optional[Tuple[float, float, float]]:
+    """把窗口中心从 AOI 挪到最近的"有效像元"。
+
+    Sentinel-2 瓦片在 UTM 下是旋转的，瓦片包围盒的角上是大片 nodata；
+    如果 AOI 恰好落在角上，直接按经纬度取窗口会读出一片 0。
+    这里用 SCL 的整幅缩略图找最近的有效像元，返回 (x_utm, y_utm, 偏移公里)。
+    """
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.warp import transform as warp_transform
+
+    with rasterio.Env(**_GDAL_ENV):
+        with _open_vsicurl(item["assets"]["scl"]["href"]) as src:
+            xs, ys = warp_transform("EPSG:4326", src.crs, [lon], [lat])
+            x, y = float(xs[0]), float(ys[0])
+            col, row = ~src.transform * (x, y)  # 全分辨率像素坐标
+            ov_size = 256
+            ov = src.read(1, out_shape=(ov_size, ov_size), resampling=Resampling.nearest)
+            crs, transform, width, height = src.crs, src.transform, src.width, src.height
+
+    valid = ov > 0
+    if not valid.any():
+        return None
+    # AOI 在缩略图上的位置
+    oc = int(round(col * ov_size / width))
+    orow = int(round(row * ov_size / height))
+    if 0 <= oc < ov_size and 0 <= orow < ov_size and valid[orow, oc]:
+        return x, y, 0.0
+    # 找最近的有效缩略图像元
+    vy, vx = np.nonzero(valid)
+    dist2 = (vy - orow) ** 2 + (vx - oc) ** 2
+    i = int(np.argmin(dist2))
+    # 缩略图像元 -> 全分辨率 -> UTM 坐标
+    px = (vx[i] + 0.5) * width / ov_size
+    py = (vy[i] + 0.5) * height / ov_size
+    nx, ny = transform * (px, py)
+    shift_km = float(np.hypot(nx - x, ny - y) / 1000.0)
+    if shift_km > max_shift_km:
+        return None
+    return float(nx), float(ny), shift_km
+
+
+def scene_window_quality(item: Dict[str, Any], x_utm: float, y_utm: float, half_km: float = 5.0) -> Dict[str, float]:
+    """用 SCL 评估窗口的云量/水体/有效率（低分辨率快读）。"""
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.windows import from_bounds
+
+    with rasterio.Env(**_GDAL_ENV):
+        with _open_vsicurl(item["assets"]["scl"]["href"]) as src:
+            win = from_bounds(x_utm - half_km * 1000, y_utm - half_km * 1000,
+                              x_utm + half_km * 1000, y_utm + half_km * 1000,
+                              transform=src.transform)
+            scl = src.read(1, window=win, out_shape=(128, 128), resampling=Resampling.nearest)
+    total = max(scl.size, 1)
+    return {
+        "cloud_pct": 100.0 * float(np.isin(scl, CLOUD_CLASSES).sum()) / total,
+        "water_pct": 100.0 * float((scl == 6).sum()) / total,
+        "valid_pct": 100.0 * float((scl > 0).sum()) / total,
+    }
+
+
+# --------------------------------------------------------------------------
+# 事件抓取
+# --------------------------------------------------------------------------
+
+
+def _pick_scene(
+    candidates: List[Dict[str, Any]],
+    lon: float,
+    lat: float,
+    target_date: str,
+    max_cloud: float,
+    half_km: float,
+    allow_cloudy: bool = False,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, float], Tuple[float, float, float]]]:
+    """在候选景中挑"有效数据 + 窗口云量低 + 时间接近目标"的一景。"""
+    scored: List[Tuple[float, Dict[str, Any], Dict[str, float], Tuple[float, float, float]]] = []
+    for item in candidates:
+        if not point_in_bbox(item["bbox"], lon, lat):
+            continue
+        try:
+            center = find_valid_center(item, lon, lat)
+            if center is None:
+                print(f"    {item['properties']['datetime'][:10]}  {item['id']:34s}  ✗ AOI 附近无有效数据")
+                continue
+            x, y, shift = center
+            q = scene_window_quality(item, x, y, half_km=half_km)
+            if q["valid_pct"] < 50:
+                print(f"    {item['properties']['datetime'][:10]}  {item['id']:34s}  ✗ 有效率仅 {q['valid_pct']:.0f}%")
+                continue
+        except Exception as exc:
+            print(f"    [skip] {item['id']}: {type(exc).__name__} {str(exc)[:60]}")
+            continue
+        date = item["properties"]["datetime"][:10]
+        dt_days = abs((np.datetime64(date) - np.datetime64(target_date)) / np.timedelta64(1, "D"))
+        score = q["cloud_pct"] + 1.5 * dt_days + 2.0 * shift
+        scored.append((score, item, q, center))
+        print(f"    {date}  {item['id']:34s} 窗口云量 {q['cloud_pct']:5.1f}%  "
+              f"水体 {q['water_pct']:5.1f}%  有效 {q['valid_pct']:3.0f}%  "
+              f"挪窗 {shift:4.1f}km  评分 {score:6.1f}")
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0])
+    best = scored[0]
+    if best[2]["cloud_pct"] > max_cloud:
+        msg = (f"最优景窗口云量 {best[2]['cloud_pct']:.1f}% 超过阈值 {max_cloud}%，"
+               f"说明该时段光学影像被云遮挡")
+        if not allow_cloudy:
+            print(f"    ✗ {msg}。可换事件/日期，或加 --allow-cloudy 强制使用")
+            return None
+        print(f"    ⚠ {msg}（--allow-cloudy 已强制使用）")
+    return best[1], best[2], best[3]
+
+
+def _reflectance_scale(item: Dict[str, Any], band: str) -> Tuple[float, float]:
+    """从 STAC 元数据读 scale/offset（2022 年后 offset = -0.1）。"""
+    rb = (item["assets"].get(band, {}).get("raster:bands") or [{}])[0]
+    return float(rb.get("scale", 0.0001) or 0.0001), float(rb.get("offset", 0.0) or 0.0)
+
+
+_BAND_TO_JP2 = {"blue": ("B02", "R10m"), "green": ("B03", "R10m"),
+                "red": ("B04", "R10m"), "nir": ("B08", "R10m")}
+
+
+def jp2_href(item: Dict[str, Any], band: str) -> Optional[str]:
+    """由 STAC 条目 id 拼出原始 JP2（ESA 官方产品）地址，用于偏移量权威判定。"""
+    try:
+        parts = item["id"].split("_")  # S2A_50RMT_20200519_1_L2A
+        mgrs, date, seq = parts[1], parts[2], parts[3]
+        zone, latband, square = mgrs[:2], mgrs[2], mgrs[3:5]
+        band_id, res = _BAND_TO_JP2[band]
+        return (f"https://sentinel-s2-l2a.s3.amazonaws.com/tiles/{zone}/{latband}/{square}/"
+                f"{date[:4]}/{int(date[4:6])}/{int(date[6:8])}/{seq}/{res}/{band_id}.jp2")
+    except Exception:
+        return None
+
+
+def detect_offset_applied(
+    item: Dict[str, Any], crs: Any, bounds: Tuple[float, float, float, float]
+) -> Tuple[bool, str]:
+    """判定 COG 是否已经应用了 BOA 偏移（baseline>=04.00 的 -1000）。
+
+    背景：Element84 的 `earthsearch:boa_offset_applied` 标记存在已知错误
+    （issue #66/#71），官方建议与原始 JP2 比对。这里就用 JP2 做权威判定：
+        同一窗口 |中位DN_COG - 中位DN_JP2| ≈ 1000  ->  COG 已扣偏移
+                                       ≈ 0      ->  COG 未扣偏移
+    读 JP2 失败时退回 STAC 标记。
+    """
+    band = "red"
+    _scale, offset = _reflectance_scale(item, band)
+    if offset == 0.0:  # baseline < 04.00，本来就没有偏移
+        return False, "无偏移(baseline<04.00)"
+    href = jp2_href(item, band)
+    if href:
+        try:
+            jp2, _ = read_window(href, crs, bounds, out_size=256)
+            cog, _ = read_window(item["assets"][band]["href"], crs, bounds, out_size=256)
+            diff = float(np.median(cog) - np.median(jp2))
+            print(f"    [offset] COG中位DN={np.median(cog):.0f}  JP2中位DN={np.median(jp2):.0f}  Δ={diff:+.0f}")
+            return abs(diff) > 600, f"JP2比对(ΔDN={diff:.0f})"
+        except Exception as exc:
+            print(f"    [warn] JP2 比对失败({type(exc).__name__})，退回 STAC 标记")
+    flag = bool(item["properties"].get("earthsearch:boa_offset_applied", False))
+    return flag, f"STAC标记(boa_offset_applied={flag})"
+
+
+def reflectance_from_dn(dn: np.ndarray, scale: float, offset: float, offset_applied: bool) -> np.ndarray:
+    """DN -> 反射率。COG 已扣过偏移时把 offset 置 0，避免二次扣除。"""
+    eff_offset = 0.0 if offset_applied else offset
+    return dn.astype(np.float32) * scale + eff_offset
+
+
+def fetch_scene(
+    item: Dict[str, Any],
+    x_utm: float,
+    y_utm: float,
+    size: int,
+    out_tif: str,
+) -> Dict[str, Any]:
+    """抓取一景的 4 波段窗口并落盘为 GeoTIFF（窗口以 x_utm/y_utm 为中心）。"""
+    import rasterio
+
+    half_km = size * 10.0 / 2000.0  # 10 m 像元 -> 公里
+    bounds = (x_utm - half_km * 1000, y_utm - half_km * 1000,
+              x_utm + half_km * 1000, y_utm + half_km * 1000)
+    with rasterio.Env(**_GDAL_ENV):
+        with _open_vsicurl(item["assets"]["blue"]["href"]) as src:
+            crs = src.crs
+
+        offset_applied, offset_method = detect_offset_applied(item, crs, bounds)
+        print(f"    [offset] 判定 COG 已扣偏移={offset_applied}  依据：{offset_method}")
+
+        bands: Dict[str, np.ndarray] = {}
+        for band in ("blue", "green", "red", "nir"):
+            scale, offset = _reflectance_scale(item, band)
+            raw, wtransform = read_window(item["assets"][band]["href"], crs, bounds, out_size=size)
+            refl = reflectance_from_dn(raw, scale, offset, offset_applied)
+            # 落盘为"反射率 ×10000"的干净产品，供 preprocess.to_reflectance 直接除 10000
+            bands[band] = np.clip(refl * 10000.0, 1, 10000).astype(np.uint16)
+            transform = wtransform
+            neg = 100.0 * float((refl < 0).mean())
+            print(f"    {band:6s} scale={scale:g} offset={offset:+.3f}  "
+                  f"中位 DN={np.median(raw):7.1f} -> 反射率 {np.median(refl):.4f}  负值占比 {neg:4.1f}%")
+
+        scl, _ = read_window(item["assets"]["scl"]["href"], crs, bounds, out_size=size,
+                             dtype="uint8")
+        arr = np.stack([bands["blue"], bands["green"], bands["red"], bands["nir"]], axis=0)
+
+    profile = {
+        "driver": "GTiff", "height": size, "width": size, "count": 4, "dtype": "uint16",
+        "crs": crs, "transform": transform, "compress": "deflate", "predictor": 2,
+        "nodata": 0, "tiled": True, "blockxsize": 256, "blockysize": 256,
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(out_tif)), exist_ok=True)
+    with rasterio.open(out_tif, "w", **profile) as ds:
+        ds.write(arr)
+        for i, name in enumerate(("B2(blue)", "B3(green)", "B4(red)", "B8(nir)"), start=1):
+            ds.set_band_description(i, name)
+
+    total = max(scl.size, 1)
+    valid_frac = float(np.count_nonzero(arr[0]) / max(arr[0].size, 1))
+    if valid_frac < 0.5:
+        print(f"    ⚠ 有效像元仅 {valid_frac*100:.0f}%，窗口可能落在瓦片 nodata 区")
+    return {
+        "scl": scl,
+        "cloud_pct": 100.0 * float(np.isin(scl, CLOUD_CLASSES).sum()) / total,
+        "water_pct": 100.0 * float((scl == 6).sum()) / total,
+        "valid_pct": 100.0 * valid_frac,
+        "offset_applied": offset_applied,
+        "offset_method": offset_method,
+        "arr": arr,
+    }
+
+
+def save_scl_png(scl: np.ndarray, path: str) -> str:
+    from PIL import Image
+
+    rgb = np.zeros((*scl.shape, 3), dtype=np.uint8)
+    for k, color in SCL_COLORS.items():
+        rgb[scl == k] = color
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    Image.fromarray(rgb).save(path)
+    return path
+
+
+def save_preview(pre_arr: np.ndarray, post_arr: np.ndarray, path: str, max_width: int = 1100) -> str:
+    """灾前/灾后真彩预览（B4,B3,B2 -> RGB，联合百分位拉伸）。"""
+    from PIL import Image
+
+    def to_rgb(a: np.ndarray) -> np.ndarray:
+        return np.moveaxis(a[[2, 1, 0]].astype(np.float32), 0, -1)
+
+    pre_rgb, post_rgb = to_rgb(pre_arr), to_rgb(post_arr)
+    lo, hi = np.percentile(np.concatenate([pre_rgb.ravel(), post_rgb.ravel()]), [2, 98])
+    norm = lambda x: (np.clip((x - lo) / max(hi - lo, 1e-6), 0, 1) * 255).astype(np.uint8)  # noqa: E731
+    gap = np.full((pre_rgb.shape[0], 8, 3), 255, dtype=np.uint8)
+    canvas = np.concatenate([norm(pre_rgb), gap, norm(post_rgb)], axis=1)
+    im = Image.fromarray(canvas)
+    if im.width > max_width:
+        im = im.resize((max_width, int(im.height * max_width / im.width)), Image.LANCZOS)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    im.save(path, quality=88, optimize=True)
+    return path
+
+
+def fetch_event(
+    key: str,
+    cfg: Dict[str, Any],
+    out_dir: str,
+    size: Optional[int] = None,
+    max_cloud: float = 25.0,
+    allow_cloudy: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """抓取一个事件的一对灾前/灾后影像。"""
+    lon, lat = cfg["aoi"]
+    size = int(size or cfg.get("size", 1280))
+    half_km = size * 10.0 / 2000.0  # 质检窗口与最终抓取窗口保持同尺寸
+    pad = 0.25  # 检索框略大于 AOI，确保覆盖
+    bbox = [lon - pad, lat - pad, lon + pad, lat + pad]
+
+    print("=" * 78)
+    print(f"事件：{cfg['label']}   AOI=({lon}, {lat})   窗口 {size}×{size}（{size*10/1000:.1f} km）")
+    print(f"说明：{cfg['note']}")
+    print("-" * 78)
+
+    result: Dict[str, Any] = {}
+    for tag in ("pre", "post"):
+        start, end, target = cfg[tag]
+        print(f"[{tag}] 检索 {start} ~ {end}（目标 {target}）")
+        items = stac_search(bbox, f"{start}T00:00:00Z/{end}T23:59:59Z")
+        print(f"  候选 {len(items)} 景，逐个评估 AOI 窗口云量：")
+        picked = _pick_scene(items, lon, lat, target, max_cloud, half_km, allow_cloudy)
+        if picked is None:
+            print(f"  ✗ 没有找到覆盖 AOI 的可用景")
+            return None
+        item, quality, center = picked
+        result[tag] = (item, quality, center)
+        print(f"  ✓ 选定 {item['id']}  {item['properties']['datetime'][:16]}  "
+              f"窗口云量 {quality['cloud_pct']:.1f}%  挪窗 {center[2]:.1f} km")
+
+    entry: Dict[str, Any] = {
+        "id": key,
+        "label": cfg["label"],
+        "description": cfg["note"],
+        "aoi": [lon, lat],
+        "size": [size, size],
+        "pixel_size_m": 10.0,
+        "pre": f"{key}_pre.tif",
+        "post": f"{key}_post.tif",
+        "preview": f"{key}_preview.jpg",
+        "pre_scl": f"{key}_pre_scl.png",
+        "post_scl": f"{key}_post_scl.png",
+        "provenance": {},
+    }
+
+    for tag in ("pre", "post"):
+        item, quality, center = result[tag]
+        print(f"[{tag}] 抓取 4 波段 + SCL ...")
+        t0 = time.time()
+        data = fetch_scene(item, center[0], center[1], size, os.path.join(out_dir, entry[tag]))
+        save_scl_png(data["scl"], os.path.join(out_dir, entry[f"{tag}_scl"]))
+        entry[f"{tag}_arr"] = data["arr"]
+        entry["provenance"][f"{tag}_scene"] = item["id"]
+        entry["provenance"][f"{tag}_datetime"] = item["properties"]["datetime"]
+        entry["provenance"][f"{tag}_scene_cloud_pct"] = round(float(item["properties"]["eo:cloud_cover"]), 1)
+        entry["provenance"][f"{tag}_window_cloud_pct"] = round(quality["cloud_pct"], 1)
+        entry["provenance"][f"{tag}_window_water_pct"] = round(quality["water_pct"], 1)
+        entry["provenance"][f"{tag}_window_shift_km"] = round(center[2], 2)
+        entry["provenance"][f"{tag}_epsg"] = int(item["properties"]["proj:epsg"])
+        entry["provenance"][f"{tag}_boa_offset_applied"] = bool(data.get("offset_applied", False))
+        entry["provenance"][f"{tag}_offset_basis"] = data.get("offset_method", "-")
+        print(f"  完成，用时 {time.time()-t0:.1f}s  窗口云量 {quality['cloud_pct']:.1f}%  "
+              f"水体 {quality['water_pct']:.1f}%")
+
+    save_preview(entry.pop("pre_arr"), entry.pop("post_arr"), os.path.join(out_dir, entry["preview"]))
+
+    entry["provenance"].update({
+        "source": "Sentinel-2 L2A (COG on AWS) via Element84 Earth Search STAC",
+        "stac_api": STAC_API,
+        "license": "Copernicus Sentinel Data Terms and Conditions (free and open)",
+        "fetch_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "note": "反射率已按 STAC 元数据应用 scale/offset，落盘为 反射率×10000 的 uint16",
+    })
+    return entry
+
+
+# --------------------------------------------------------------------------
+# 主流程
+# --------------------------------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="抓取真实 Sentinel-2 洪涝影像")
+    ap.add_argument("--event", default="all", help="事件名或 all")
+    ap.add_argument("--out", default=os.path.join(ROOT, "data", "real"))
+    ap.add_argument("--size", type=int, default=None, help="窗口边长（像元，10m）")
+    ap.add_argument("--max-cloud", type=float, default=25.0, help="AOI 窗口最大可接受云量(%)")
+    ap.add_argument("--list", action="store_true", help="列出内置事件")
+    ap.add_argument("--allow-cloudy", action="store_true", help="窗口云量超标时仍强制使用（默认拒绝）")
+    args = ap.parse_args()
+
+    if args.list:
+        print("内置洪涝事件：")
+        for k, v in EVENTS.items():
+            print(f"  {k:16s} {v['label']}")
+            print(f"  {'':16s} AOI={v['aoi']}  灾前={v['pre'][:2]}  灾后={v['post'][:2]}")
+        return
+
+    keys = list(EVENTS) if args.event == "all" else [args.event]
+    for k in keys:
+        if k not in EVENTS:
+            raise SystemExit(f"未知事件 {k}，可选：{list(EVENTS)}")
+
+    os.makedirs(args.out, exist_ok=True)
+    manifest_path = os.path.join(args.out, "samples.json")
+    manifest: Dict[str, Any] = {"samples": []}
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        manifest.setdefault("samples", [])
+
+    manifest.update({
+        "note": "真实 Sentinel-2 L2A 影像（AWS 公开 COG，经 Element84 Earth Search 检索），"
+                "用于演示与验证；不含人工标注掩膜。",
+        "pixel_size_m": 10.0,
+        "bands": ["B2(blue)", "B3(green)", "B4(red)", "B8(nir)"],
+    })
+
+    for k in keys:
+        entry = fetch_event(k, EVENTS[k], args.out, size=args.size, max_cloud=args.max_cloud, allow_cloudy=args.allow_cloudy)
+        if entry is None:
+            print(f"✗ {k} 抓取失败")
+            continue
+        manifest["samples"] = [s for s in manifest["samples"] if s.get("id") != k] + [entry]
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        print(f"✓ {k} 已写入 {manifest_path}")
+
+    print("\n全部完成。产物目录：", args.out)
+    print("下一步：python -c \"from src import FloodDetector; "
+          "print(FloodDetector().detect('data/real/dongting2024_post.tif').summary_text())\"")
+
+
+if __name__ == "__main__":
+    main()

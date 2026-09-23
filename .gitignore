@@ -1,0 +1,45 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- 模型权重（体积大，用网盘/Release 分发）----
+weights/*.pt
+weights/*.pth
+weights/*.ckpt
+!weights/.gitkeep
+
+# ---- 真实遥感数据（GB 级，不入库）----
+data/sen1floods11/
+data/raw/
+data/**/*.tif.bak
+
+# ---- 运行产物 ----
+outputs/
+logs/*.csv
+logs/*.png
+logs/*.json
+logs/*.log
+logs/_unit_test_*
+
+# ---- 打包产物（体积大，用 Release/网盘分发）----
+dist/
+dist_full/
+dist_installer/
+build/flood_eyes/
+build/*.toc
+build/*.pkg
+
+# ---- 系统/编辑器 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ---- 测试缓存 ----
+.pytest_cache/

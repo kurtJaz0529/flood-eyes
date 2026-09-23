@@ -166,64 +166,30 @@ def assess_dem(
 
     try:
         import rasterio
-        from rasterio.warp import Resampling, reproject
+        from rasterio.enums import Resampling
+        from rasterio.vrt import WarpedVRT
     except Exception as exc:  # pragma: no cover - 环境缺 rasterio
         raise RuntimeError(f"缺少 rasterio，无法读取 DEM：{exc}") from exc
 
+    shape = tuple(scene.shape)
     try:
         with rasterio.open(dem_path) as ds:
-            dem = ds.read(1).astype(np.float64)
-            dem_transform, dem_crs, dem_nodata = ds.transform, ds.crs, ds.nodata
-            if dem_transform is None or dem_crs is None:
-                raise ValueError("DEM 缺少 CRS/仿射变换，无法重投影到影像网格")
-            valid = np.isfinite(dem)
-            try:
-                valid &= ds.read_masks(1) > 0
-            except Exception:
-                pass
-            if dem_nodata is not None:
-                nod = float(dem_nodata)
-                if np.isnan(nod):
-                    valid &= ~np.isnan(dem)
-                else:
-                    # 固定容差：默认 rtol 会把接近 nodata 的合法高程也误判为无数据
-                    valid &= ~np.isclose(dem, nod, rtol=0.0, atol=1e-6)
+            if ds.count < 1 or ds.crs is None or ds.transform is None:
+                raise ValueError("DEM 缺少波段、CRS 或仿射变换，无法重投影到影像网格")
+            # GDAL 按目标影像网格按需读源 DEM，避免先把整幅大 DEM 装入内存。
+            with WarpedVRT(
+                ds, crs=crs, transform=transform, width=shape[1], height=shape[0],
+                resampling=Resampling.bilinear, nodata=np.nan, dtype="float32",
+            ) as vrt:
+                warped = vrt.read(1, masked=True)
+                elevation = np.ma.filled(warped, np.nan).astype(np.float32, copy=False)
+                coverage = vrt.read_masks(1) > 0
     except (FileNotFoundError, ValueError):
         raise
     except Exception as exc:
         raise ValueError(f"无法读取 DEM（{type(exc).__name__}: {exc}）：{dem_path}") from exc
 
-    # 先把 DEM 无效像元置 NaN：否则 nodata 值（如 -9999）会被双线性插值当成真实高程，
-    # 在无效区边缘制造假陡坡。
-    dem = np.where(valid, dem, np.nan)
-
-    shape = tuple(scene.shape)
-    elevation = np.full(shape, np.nan, dtype=np.float32)
-    coverage = np.zeros(shape, dtype=np.float32)
-    reproject(
-        source=dem.astype(np.float32),
-        destination=elevation,
-        src_transform=dem_transform,
-        src_crs=dem_crs,
-        dst_transform=transform,
-        dst_crs=crs,
-        resampling=Resampling.bilinear,
-        src_nodata=np.nan,
-        dst_nodata=np.nan,
-    )
-    # 覆盖范围用最近邻单独重投影一次：范围外留在 0，不会被插值成"缓坡"
-    reproject(
-        source=valid.astype(np.float32),
-        destination=coverage,
-        src_transform=dem_transform,
-        src_crs=dem_crs,
-        dst_transform=transform,
-        dst_crs=crs,
-        resampling=Resampling.nearest,
-        src_nodata=None,
-        dst_nodata=0.0,
-    )
-    assessed = np.isfinite(elevation) & (coverage >= 0.5)
+    assessed = np.isfinite(elevation) & coverage
     scene_nodata = getattr(scene, "nodata_mask", None)
     if scene_nodata is not None:
         mask = np.asarray(scene_nodata, dtype=bool)

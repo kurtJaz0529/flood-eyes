@@ -374,23 +374,28 @@ def _parse_ts(value: Any) -> Optional[datetime]:
 
 
 def recover_interrupted_jobs(out_root: str, stale_after_s: float = 900.0) -> Dict[str, Any]:
-    """显式恢复中断任务；有正在运行（且仍在刷新）的任务时拒绝，避免打断活进程。"""
+    """显式恢复中断任务；持有执行权的进程即使长时间无进度也不会被打断。"""
     store = get_store(out_root)
-    now = datetime.now()
-    live: List[str] = []
-    for job in store.list_jobs():
-        if job.get("status") != RUNNING:
-            continue
-        stamp = _parse_ts(job.get("updated_at") or job.get("started_at"))
-        age = (now - stamp).total_seconds() if stamp else 0.0
-        if age < float(stale_after_s):
-            live.append(job["job_id"])
-    if live:
-        return {"recovered": 0, "running": live,
-                "message": f"检测到 {len(live)} 个任务正在执行，已跳过恢复以免打断正在运行的任务。"}
-    count = store.recover_interrupted()
-    return {"recovered": count, "running": [],
-            "message": f"已把 {count} 个中断任务标记为可重试。"}
+    with store.worker_lock() as acquired:
+        if not acquired:
+            running = [job["job_id"] for job in store.list_jobs() if job.get("status") == RUNNING]
+            return {"recovered": 0, "running": running,
+                    "message": "检测到队列正在执行，已跳过恢复以免打断正在运行的任务。"}
+        now = datetime.now()
+        live: List[str] = []
+        for job in store.list_jobs():
+            if job.get("status") != RUNNING:
+                continue
+            stamp = _parse_ts(job.get("updated_at") or job.get("started_at"))
+            age = (now - stamp).total_seconds() if stamp else 0.0
+            if age < float(stale_after_s):
+                live.append(job["job_id"])
+        if live:
+            return {"recovered": 0, "running": live,
+                    "message": f"检测到 {len(live)} 个近期任务，已跳过恢复；若原进程已退出，请稍后重试。"}
+        count = store.recover_interrupted()
+        return {"recovered": count, "running": [],
+                "message": f"已把 {count} 个中断任务标记为可重试。"}
 
 
 # --------------------------------------------------------------------------

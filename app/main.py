@@ -952,7 +952,7 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
     with gr.Blocks(**_blocks_kwargs("慧眼识灾 · 遥感 AI 洪水识别系统")) as demo:
         gr.HTML(_header_html())
         gr.Markdown(
-            "在地图上点选任意地点（或搜索地名），填好灾前/灾后时间范围后一键分析。"
+            "在地图上点选任意地点后点击‘使用此地点’（或搜索地名），填好灾前/灾后时间范围后一键分析。"
             "系统按所选地点下载 Sentinel-2 公开影像并对比，首次下载约 1–3 分钟，同一地点再次分析走本地缓存。"
         )
 
@@ -1056,12 +1056,6 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
             "window._heyePreStart ?? a, window._heyePreEnd ?? b, "
             "window._heyePostStart ?? c, window._heyePostEnd ?? d]"
         )
-        _GO_JS = (
-            "(lon, lat, a, b, c, d, w, terrain, dem) => ["
-            "window._heyeLon ?? lon, window._heyeLat ?? lat, "
-            "window._heyePreStart ?? a, window._heyePreEnd ?? b, "
-            "window._heyePostStart ?? c, window._heyePostEnd ?? d, w, terrain, dem]"
-        )
         # 事件库：搜索 → 选一个 → 一键把坐标与时间填进表单
         event_search_btn.click(
             search_event_library,
@@ -1109,7 +1103,6 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
             inputs=[lon_in, lat_in, pre_start, pre_end, post_start, post_end, win_size,
                     terrain_profile, dem_input],
             outputs=[slider, change_img, pipe_stats, pipe_summary, pipe_zip, pipe_log],
-            js=_GO_JS,
         )
         from app.automation import build_automation_ui
         build_automation_ui(os.path.join(OUT_DIR, "automation"))

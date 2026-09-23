@@ -128,6 +128,41 @@ class JobStore:
             conn.close()
 
     @contextmanager
+    def worker_lock(self) -> Iterator[bool]:
+        """跨进程独占队列执行权；非阻塞获取，供执行与恢复共同使用。"""
+        lock_path = self.db_path + ".worker.lock"
+        with open(lock_path, "a+b") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"0")
+                fh.flush()
+            fh.seek(0)
+            acquired = False
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                    except BlockingIOError:
+                        pass
+                yield acquired
+            finally:
+                if acquired:
+                    fh.seek(0)
+                    if os.name == "nt":
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         """BEGIN IMMEDIATE：写事务从读取队首起就占锁，避免重复领取。"""
         conn = self._connect()
@@ -318,6 +353,12 @@ class QueueRunner:
         return lambda: self.store.is_cancel_requested(job_id)
 
     def run_pending(self) -> Iterator[Dict[str, Any]]:
+        with self.store.worker_lock() as acquired:
+            if not acquired:
+                return
+            yield from self._run_locked()
+
+    def _run_locked(self) -> Iterator[Dict[str, Any]]:
         while True:
             job = self.store.claim_next()
             if job is None:

@@ -50,6 +50,15 @@ class JobStoreTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_worker_lock_is_exclusive_across_store_instances(self):
+        other = jobs.JobStore(self.db)
+        with self.store.worker_lock() as acquired:
+            self.assertTrue(acquired)
+            with other.worker_lock() as second:
+                self.assertFalse(second)
+        with other.worker_lock() as acquired_again:
+            self.assertTrue(acquired_again)
+
     # -- 辅助 -------------------------------------------------------------
 
     def _run(self, runner):

@@ -411,16 +411,16 @@ def export_bundle(
         # 原实现只导出统计量，拿到成果包无法回溯原始影像。
         prov = result.meta.get("provenance")
         if isinstance(prov, dict) and prov:
-            for tag, name in (("pre", "灾前影像"), ("post", "灾后影像")):
+            for tag, label in (("pre", "灾前影像"), ("post", "灾后影像")):
                 scene = prov.get(f"{tag}_scene")
                 if scene:
                     when = str(prov.get(f"{tag}_datetime", ""))[:10]
-                    metrics.append((name, f"{scene}　{when}".strip()))
+                    metrics.append((label, f"{scene}　{when}".strip()))
             clouds = []
-            for tag, name in (("pre", "灾前"), ("post", "灾后")):
+            for tag, label in (("pre", "灾前"), ("post", "灾后")):
                 value = prov.get(f"{tag}_window_cloud_pct")
                 if value is not None:
-                    clouds.append(f"{name} {value}%")
+                    clouds.append(f"{label} {value}%")
             if clouds:
                 metrics.append(("窗口云量", "　".join(clouds)))
             if prov.get("source"):

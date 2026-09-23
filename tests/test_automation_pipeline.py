@@ -243,6 +243,14 @@ class TestLocalPipeline(PipelineTestCase):
 
 
 class TestAcquisitionIsMocked(PipelineTestCase):
+    def test_acquisition_rejects_file_outside_request_cache(self):
+        fake_module = types.SimpleNamespace(fetch_event=lambda *args, **kwargs: {
+            "pre": "../other_request.tif", "post": "fake_post.tif",
+        })
+        with mock.patch.object(pipeline, "_FETCH_MODULE", fake_module):
+            with self.assertRaisesRegex(RuntimeError, "文件名无效"):
+                run_pipeline(self.request, self.out, run_id="bad_cache_entry")
+
     def test_mocked_acquisition_uses_request_cache_and_records_provenance(self):
         calls = []
 
@@ -371,6 +379,17 @@ class TestBatchHelpers(PipelineTestCase):
         self.assertEqual(outcome["recovered"], 0)
         self.assertEqual(outcome["running"], [job_id])
         self.assertEqual(store.get(job_id)["status"], "running")
+
+    def test_recover_keeps_long_running_worker(self):
+        store = automation.get_store(self.out)
+        job_id = store.enqueue({"request": self.request.to_dict()})
+        with store.worker_lock() as acquired:
+            self.assertTrue(acquired)
+            store.claim_next()
+            outcome = automation.recover_interrupted_jobs(self.out, stale_after_s=0)
+            self.assertEqual(outcome["recovered"], 0)
+            self.assertEqual(outcome["running"], [job_id])
+            self.assertEqual(store.get(job_id)["status"], "running")
 
 
 if __name__ == "__main__":

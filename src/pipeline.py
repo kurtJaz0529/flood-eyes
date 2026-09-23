@@ -282,7 +282,12 @@ def _acquire(request: PipelineRequest, out_root: str) -> Tuple[str, str, Dict[st
         name = entry.get(role)
         if not name:
             continue
-        full = os.path.join(cache_dir, str(name))
+        # 获取清单中的文件名必须留在该请求自己的缓存目录内。
+        # 拒绝绝对路径和 ../，避免损坏或被改写的清单串用其他请求的影像。
+        name = str(name)
+        if os.path.basename(name) != name or name in (".", ".."):
+            raise RuntimeError(f"获取结果的{role}文件名无效：{name}")
+        full = os.path.join(cache_dir, name)
         if not os.path.isfile(full):
             if role in ("pre", "post"):
                 raise RuntimeError(f"获取结果缺少{role}影像：{full}")
@@ -411,14 +416,6 @@ def _export(result: Any, run_dir: str) -> Tuple[Dict[str, Any], Dict[str, str]]:
     extra["after_overlay"] = after_path
 
     bundled = export_bundle(result, out_dir=run_dir, basename="bundle")
-    # 归一化 ZIP 名：当前 report.export_bundle 在存在 provenance 时会用循环变量 name
-    # 覆盖入参 basename（"灾后"），导致 ZIP 名随溯源内容漂移。这里改回请求的名字，
-    # 保证同一 run_id 的产物名稳定、可校验（不修改 report.py，由根协调者处理）。
-    expected_zip = os.path.join(run_dir, "bundle.zip")
-    current_zip = bundled.get("zip")
-    if current_zip and os.path.abspath(current_zip) != os.path.abspath(expected_zip):
-        os.replace(current_zip, expected_zip)
-        bundled["zip"] = expected_zip
     files = dict(bundled.get("files") or {})
     files.update(extra)
     return bundled, files
@@ -429,7 +426,7 @@ def _export(result: Any, run_dir: str) -> Tuple[Dict[str, Any], Dict[str, str]]:
 # --------------------------------------------------------------------------
 
 
-def _verify_completed(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _verify_completed(payload: Dict[str, Any], run_dir: str) -> Optional[Dict[str, Any]]:
     """校验已完成清单里的全部成果哈希；全部吻合才允许直接复用。"""
     if not payload.get("completed"):
         return None
@@ -437,18 +434,25 @@ def _verify_completed(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     artifacts = payload.get("artifacts")
     if not isinstance(result, dict) or not isinstance(artifacts, dict):
         return None
+    files = result.get("files")
+    if not isinstance(files, dict) or set(artifacts) != set(files) | {"zip"}:
+        return None
+    run_base = os.path.normcase(os.path.realpath(run_dir))
     for name, record in artifacts.items():
         if not isinstance(record, dict):
             return None
         path = record.get("path")
-        if not path or not os.path.isfile(path):
+        expected = result.get("zip") if name == "zip" else files.get(name)
+        if not isinstance(path, str) or path != expected or not os.path.isfile(path):
             return None
         try:
+            if os.path.commonpath([run_base, os.path.normcase(os.path.realpath(path))]) != run_base:
+                return None
             if int(record.get("bytes", -1)) != os.path.getsize(path):
                 return None
             if record.get("sha256") != _sha256_file(path):
                 return None
-        except OSError:
+        except (OSError, ValueError):
             return None
     if not result.get("zip") or not artifacts.get("zip"):
         return None
@@ -498,7 +502,7 @@ def run_pipeline(
                         f"run_id {run_id} 已存在且对应不同请求/输入，拒绝覆盖。"
                         "请换一个新的 run_id，或删除该运行目录后重试。"
                     )
-                resumed = _verify_completed(existing)
+                resumed = _verify_completed(existing, run_dir)
                 if resumed is not None:
                     _progress(progress, "检测到已完成的成果包，直接复用（不重复处理）", "resume")
                     return _jsonable(resumed)

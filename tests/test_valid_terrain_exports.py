@@ -239,8 +239,10 @@ def test_export_bundle_writes_gis_tiffs_and_zip():
     import rasterio
 
     result, nodata = _compare_result_with_terrain()
+    result.meta["provenance"] = {"pre_scene": "PRE", "post_scene": "POST"}
     with tempfile.TemporaryDirectory() as td:
         out = report.export_bundle(result, out_dir=td, basename="gis_test", include_pdf=True)
+        assert os.path.basename(out["zip"]) == "gis_test.zip"
         files = out["files"]
         for key in ("mask", "overlay", "rgb", "heatmap", "comparison",
                     "water_mask_tif", "valid_mask_tif", "change_tif", "terrain_risk_tif",

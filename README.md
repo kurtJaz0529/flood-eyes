@@ -69,7 +69,7 @@
 | **GIS 成果** | 成果包内含 `water_mask.tif` / `valid_mask.tif` / `change.tif` / `terrain_risk.tif`，与源影像同 CRS、transform，可直接导入 GIS |
 | **批量任务** | SQLite 任务库 + 串行 worker；CSV/JSON 逐行校验导入（坏行只报错、不影响好行）、失败重试、显式恢复、取消排队；命令行 `scripts/run_batch.py --list/--run/--retry/--cancel/--recover` |
 
-详见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/遥感自动化改进路线图_20260923.md](docs/遥感自动化改进路线图_20260923.md)。
+操作步骤见 [自动化处理使用说明](docs/自动化处理使用说明.md)；实施范围与后续方向见 [遥感自动化改进路线图](docs/遥感自动化改进路线图_20260923.md)。
 
 ## 🚀 30 秒跑起来
 

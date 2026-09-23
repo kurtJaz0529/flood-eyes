@@ -94,7 +94,7 @@
       }
       hintEl.textContent = extra && extra.label
         ? ("已选 " + extra.label + "  " + st.slon.toFixed(4) + ", " + st.slat.toFixed(4) + "  时间范围已带出")
-        : ("已选 WGS84 " + st.slon.toFixed(4) + ", " + st.slat.toFixed(4) + "  → 可直接开始分析");
+        : ("已选 WGS84 " + st.slon.toFixed(4) + ", " + st.slat.toFixed(4) + "  → 点击‘使用此地点’填入表单");
     } catch (e) {}
   }
 

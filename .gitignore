@@ -16,6 +16,7 @@ weights/*.ckpt
 # ---- 真实遥感数据（GB 级，不入库）----
 data/sen1floods11/
 data/raw/
+data/real/
 data/**/*.tif.bak
 
 # ---- 运行产物 ----

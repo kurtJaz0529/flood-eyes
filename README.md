@@ -71,6 +71,16 @@
 
 操作步骤见 [自动化处理使用说明](docs/自动化处理使用说明.md)；实施范围与后续方向见 [遥感自动化改进路线图](docs/遥感自动化改进路线图_20260923.md)。
 
+## 🌿 本地多时相光谱监测
+
+新增独立命令行流程，可对按时间顺序排列的多景本地 GeoTIFF 计算 **NDVI 植被绿度、SAVI 稀疏植被绿度或绿光/近红外 NDWI 地表水指数**，自动配准、筛除无效像元、计算相邻时相差值并导出 GIS 栅格和 JSON 摘要。低质量时相和共同有效区不足会标为缺测；连续指数变化不直接等同于灾损或淹没面积。
+
+```powershell
+python scripts/run_spectral.py --index ndvi --images data/samples/demo01_pre.tif data/samples/demo01_post.tif
+```
+
+这两景是合成样本，仅用于检查流程。完整参数、质量口径与结果说明见 [光谱时序监测使用说明](docs/光谱时序监测使用说明.md)。这项本地工作流目前独立于在线选景和洪水批量队列。
+
 ## 🚀 30 秒跑起来
 
 ```powershell
@@ -88,7 +98,7 @@ python app/main.py            # 浏览器打开 http://127.0.0.1:7860
 ```
 
 > **没有 GPU、没有训练数据、没有任何权重也能完整演示** —— 系统会自动使用 NDWI 基线。
-> 仓库已预置 `data/real/` 两组真实影像（鄱阳湖 2020、涿州 2023），第 3 步可跳过。
+> `data/real/` 影像未纳入版本库；若本机已有这两组文件可跳过第 3 步，否则需运行抓取脚本并保持网络可用。
 
 **一行代码跑识别（真实影像）：**
 
@@ -192,7 +202,7 @@ Precision  0.872 → 0.979    (+12.3%)
 ---
 
 ## 🛰️ 真实卫星影像（不是合成数据）
-仓库里已经放好**两组真实 Sentinel-2 L2A 灾前/灾后影像**，数据来源可逐条溯源：
+项目已有**两组真实 Sentinel-2 L2A 灾前/灾后影像**的处理记录；大体积原始影像未纳入版本库，需自行抓取或从本地归档获取。数据来源可逐条溯源：
 
 | 样本 | 事件 | 灾前景（日期） | 灾后景（日期） | AOI 窗口云量 |
 |---|---|---|---|---|
@@ -203,7 +213,7 @@ Precision  0.872 → 0.979    (+12.3%)
 - 许可：Copernicus Sentinel Data Terms（免费开放）
 - 窗口：12.8 km × 12.8 km（1280×1280 像元，10 m）= 163.84 km²
 - 抓取脚本：`python scripts/fetch_real_samples.py --event all`
-- 完整溯源见 [`data/real/README.md`](data/real/README.md) 与 `data/real/samples.json`
+- 抓取完成后，可在本地 `data/real/README.md` 与 `data/real/samples.json` 核对完整溯源
 
 ### 真实影像上的识别结果（NDWI + Otsu 基线 + 近红外闸门）
 

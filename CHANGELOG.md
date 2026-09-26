@@ -8,7 +8,22 @@
 
 ---
 
-## [未发布] - 2026-09-23
+## [0.5.0] - 2026-09-26
+
+- 新增实验场景适配：七类地貌的指数路由、局部阈值、窄水道保留、AWEI/DEM 候选复核，保留原基线入口。网页与批量请求已接入。
+- 新增 SWIR1/SWIR2 描述与显式预设、MNDWI/NDMI/NBR 时序监测和网页成果包下载。
+- 新增两期复核 GeoTIFF 和独立标注评测，覆盖率与全标注水体召回率同时报告。
+- 修正无效像元参与 Otsu、常量场景绕过 NIR 闸门、逐波段 NoData 重采样、投影坐标微小错位及场景适配矩形像元面积问题；质量侧车参与本地成果身份。
+- GPT 主导重要工作，优先调用 WorkBuddy 的 DeepSeek V4.1 Flash 完成有界协作任务。
+- 操作与限制见 [场景适配与遥感扩展使用说明](docs/场景适配与遥感扩展使用说明.md)。本次没有独立真实标注精度结论。
+- **修复启动器在设置了 `HTTP_PROXY`/`HTTPS_PROXY` 的机器上无法启动**：Gradio 启动时会请求自己的 `http://127.0.0.1:<port>/startup-events`，该请求被代理转发后抛 `httpx.ConnectTimeout`，进程直接退出。现在启动器强制让回环地址绕过代理（`app/desktop.py: bypass_proxy_for_localhost`），不影响在线地图与卫星下载继续走用户代理。
+- 启动器新增 60 秒启动看门狗（`app/desktop.py: start_startup_watchdog`）：超时仍未完成启动时向 `logs/desktop.log` 写入可操作的排查建议，把"双击没反应"式静默失败变成可诊断记录。
+- 版本号统一为 0.5.0：`src/__init__.py`、`app/desktop.py`、`build/version_info.txt`、`build/installer.iss`（含脚本内注释与产物文件名）。
+- 本轮全套测试 262 通过、7 跳过（权重与真实影像缺失）；地图坐标回归和 CLI 入口检查通过。
+- 重新构建 Windows 精简版产物：`dist/慧眼识灾_v0.5.0_lite.zip`（185.5 MB，解压 408 MB）与 `dist_installer/慧眼识灾_安装程序_v0.5.0_精简版.exe`（143.9 MB）。完整版（含 PyTorch + U-Net）本轮未重建。
+- 冻结版端到端启动验收**未完成**：本机安全策略阻止未知可执行程序发起回环连接，Gradio 建立 asyncio 自管道时阻塞在 `socket.socketpair` 的 `accept()`。源码方式启动正常，问题定位与复现证据见 [交接说明](docs/交接说明_20260926.md)。
+
+## [未发布历史] - 2026-09-23
 
 - 修复 PDF 包含影像溯源时 ZIP 名被循环变量覆盖的问题，成果包名保持 `bundle.zip`。
 - 队列执行与恢复共用跨进程文件锁；长时间没有阶段日志的活任务不会被错误恢复。

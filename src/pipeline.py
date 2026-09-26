@@ -42,7 +42,7 @@ __all__ = ["PIPELINE_LOCK", "PIPELINE_SCHEMA", "DataQualityError", "run_pipeline
 
 #: 整个处理（获取 + 识别 + 导出）期间持有的进程级互斥锁。
 PIPELINE_LOCK = threading.RLock()
-PIPELINE_SCHEMA = 1
+PIPELINE_SCHEMA = 2
 #: 下载脚本模块级全局（超时/快速模式）不允许并发，因此整段串行。
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -223,10 +223,22 @@ def _build_identity(
 ) -> Dict[str, Any]:
     """完成复用的身份：请求指纹 + 本地输入/DEM 内容哈希。"""
     return {
+        "pipeline_schema": PIPELINE_SCHEMA,
         "request_key": request.cache_key,
         "local_pre_sha256": _sha256_file(local_pair[0]) if local_pair else None,
         "local_post_sha256": _sha256_file(local_pair[1]) if local_pair else None,
         "dem_sha256": _sha256_file(dem) if dem else None,
+        "local_quality_sha256": {
+            f"{i}{suffix}": _sha256_file(os.path.splitext(path)[0] + suffix)
+            for i, path in enumerate(local_pair or ())
+            for suffix in ("_scl.tif", "_scl.tiff", "_scl.png")
+            if os.path.isfile(os.path.splitext(path)[0] + suffix)
+        },
+        "local_auxiliary_sha256": {
+            f"{i}{suffix}": _sha256_file(path + suffix)
+            for i, path in enumerate(local_pair or ())
+            for suffix in (".msk", ".aux.xml") if os.path.isfile(path + suffix)
+        },
         "synthetic": bool(synthetic),
     }
 
@@ -309,12 +321,18 @@ def _acquire(request: PipelineRequest, out_root: str) -> Tuple[str, str, Dict[st
 # --------------------------------------------------------------------------
 
 
-def _run_detection(request: PipelineRequest, pre_path: str, post_path: str) -> Any:
+def _run_detection(request: PipelineRequest, pre_path: str, post_path: str, dem=None) -> Any:
     """灾前/灾后识别与变化统计。基线模型（不依赖权重），云掩膜按请求云量上限。"""
     from .infer import FloodDetector
 
     detector = FloodDetector(mode="baseline", mask_clouds=True,
-                             max_cloud_pct=float(request.max_cloud_pct))
+                             max_cloud_pct=float(request.max_cloud_pct),
+                             detection_strategy=request.detection_strategy,
+                             terrain_profile=request.terrain_profile,
+                             water_index=request.water_index,
+                             index_threshold=request.index_threshold,
+                             slope_threshold_deg=request.slope_threshold_deg,
+                             band_order=request.band_order, dem_path=dem)
     return detector.compare(pre_path, post_path)
 
 
@@ -345,13 +363,20 @@ def _common_valid_stats(result: Any) -> Dict[str, Any]:
 
 
 def _attach_terrain(result: Any, request: PipelineRequest, dem: Optional[str]) -> Dict[str, Any]:
-    """附加用户声明的地形背景；有 DEM 时做坡度筛查（仅供复核，不改掩膜）。"""
+    """附加声明场景和 DEM 诊断；场景适配已在识别阶段排除需复核候选。"""
     context = terrain_context(request.terrain_profile)
     warnings = list(result.meta.get("warnings") or [])
-    warnings.append(f"地形背景为用户声明：{context['label']}；仅提示复核重点，不修改水体掩膜。")
+    adaptive = request.detection_strategy == "adaptive"
+    if adaptive:
+        context["scope"] = "user_declared_adaptive_recipe"
+        context["note"] = "按用户声明场景选择光谱配方与复核规则；默认参数尚需区域真值标定。"
+    warnings.append(f"地形背景为用户声明：{context['label']}；{context['note']}")
     result.meta["terrain"] = context
     if dem is not None:
-        risk, summary = assess_dem(dem, result.scene)
+        if "terrain_risk_mask" in result.meta:
+            risk, summary = result.meta["terrain_risk_mask"], result.meta["terrain_risk_summary"]
+        else:
+            risk, summary = assess_dem(dem, result.scene, request.slope_threshold_deg)
         result.meta["terrain_risk_mask"] = risk
         result.meta["terrain_risk_summary"] = summary
         context["dem_assessed"] = True
@@ -554,7 +579,7 @@ def run_pipeline(
 
             # ② detect
             _progress(progress, "正在识别灾前/灾后影像并计算变化…", "detect")
-            result = _run_detection(request, pre_path, post_path)
+            result = _run_detection(request, pre_path, post_path, dem)
             stats = _common_valid_stats(result)
             if stats["pixels"] <= 0 or stats["fraction_pct"] < float(request.min_valid_pct):
                 raise DataQualityError(

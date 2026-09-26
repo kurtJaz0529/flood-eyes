@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -35,10 +36,12 @@ CANONICAL = ("blue", "green", "red", "nir")
 BAND_ORDERS: Dict[str, Dict[str, int]] = {
     # Sentinel-2 四波段导出：B2 B3 B4 B8
     "s2_bgr_nir": {"blue": 0, "green": 1, "red": 2, "nir": 3},
+    "s2_6band": {"blue": 0, "green": 1, "red": 2, "nir": 3, "swir1": 4, "swir2": 5},
+    "s2_l2a_12": {"blue": 1, "green": 2, "red": 3, "nir": 7, "swir1": 10, "swir2": 11},
     # Sentinel-2 L2A 12/13 波段：B1,B2,B3,B4,... B8 在索引 7（12 波段 L2A 无 B10，B8 仍是第 8 个）
-    "s2_l2a_13": {"blue": 1, "green": 2, "red": 3, "nir": 7},
+    "s2_l2a_13": {"blue": 1, "green": 2, "red": 3, "nir": 7, "swir1": 11, "swir2": 12},
     # 10 波段常见栈：B2 B3 B4 B5 B6 B7 B8 B8A B11 B12（无 B1）
-    "s2_10band": {"blue": 0, "green": 1, "red": 2, "nir": 6},
+    "s2_10band": {"blue": 0, "green": 1, "red": 2, "nir": 6, "swir1": 8, "swir2": 9},
     # 高分/资源系列常见顺序：蓝 绿 红 近红外
     "gfx_4band": {"blue": 0, "green": 1, "red": 2, "nir": 3},
     # 三波段可见光：红 绿 蓝
@@ -182,6 +185,7 @@ def _read_tiff(path: str) -> Tuple[np.ndarray, Any, Any, Optional[np.ndarray], D
         extra["offsets"] = tuple(ds.offsets) if ds.offsets else ()
         extra["descriptions"] = tuple(ds.descriptions) if ds.descriptions else ()
         extra["tags"] = dict(ds.tags() or {})
+        extra["band_valid"] = ds.read_masks() > 0
         mask = None
         if nodata is not None:
             mask = np.all(np.isclose(arr, nodata), axis=-1)
@@ -298,7 +302,14 @@ def resolve_band_order_from_descriptions(
         d = str(raw).strip().lower().replace(" ", "")
         if not d:
             continue
-        if "nir" in d or "b08" in d or "b8(" in d or d in ("b8", "b08", "band8"):
+        token = re.split(r"[^a-z0-9]+", str(raw).strip().lower())[0]
+        if token in ("swir1", "b11", "band11", "swir16"):
+            mapping["swir1"] = i
+        elif token in ("swir2", "b12", "band12", "swir22"):
+            mapping["swir2"] = i
+        elif "rededge" in d or "red-edge" in d:
+            continue
+        elif "nir" in d or "b08" in d or "b8(" in d or d in ("b8", "b08", "band8"):
             mapping["nir"] = i
         elif "green" in d or "b03" in d or "b3(" in d or d in ("b3", "b03", "band3"):
             mapping["green"] = i
@@ -306,7 +317,7 @@ def resolve_band_order_from_descriptions(
             mapping["red"] = i
         elif "blue" in d or "b02" in d or "b2(" in d or d in ("b2", "b02", "band2"):
             mapping["blue"] = i
-    if "green" in mapping and ("nir" in mapping or "red" in mapping):
+    if mapping:
         return mapping
     return None
 
@@ -320,14 +331,16 @@ def resolve_band_order(
     if band_order and band_order != "auto":
         if band_order not in BAND_ORDERS:
             raise KeyError(f"未知波段顺序 '{band_order}'，可选：{list(BAND_ORDERS)}")
+        if max(BAND_ORDERS[band_order].values()) >= n_channels:
+            raise ValueError(f"波段预设 {band_order} 与实际 {n_channels} 波段不匹配")
         return dict(BAND_ORDERS[band_order])
     from_desc = resolve_band_order_from_descriptions(descriptions, n_channels)
     if from_desc:
         return from_desc
     if n_channels >= 12:
-        return dict(BAND_ORDERS["s2_l2a_13"])
+        return {k: v for k, v in BAND_ORDERS["s2_l2a_13"].items() if k in CANONICAL}
     if n_channels in (10, 11):
-        return dict(BAND_ORDERS["s2_10band"])
+        return {k: v for k, v in BAND_ORDERS["s2_10band"].items() if k in CANONICAL}
     if n_channels >= 4:
         return dict(BAND_ORDERS["s2_bgr_nir"])
     if n_channels == 3:
@@ -386,6 +399,10 @@ def load_scene(
         )
     meta["band_order"] = band_order if band_order != "auto" else f"auto({len(mapping)}ch)"
     meta["band_map"] = mapping
+    if extra.get("band_valid") is not None:
+        meta["spectral_band_valid"] = {
+            name: extra["band_valid"][idx] for name, idx in mapping.items()
+        }
     if extra.get("descriptions"):
         meta["band_descriptions"] = list(extra["descriptions"])
 
@@ -555,7 +572,7 @@ def same_geo_grid(a: "Scene", b: "Scene", atol: float = 1e-4) -> bool:
         tb = [float(x) for x in b.transform[:6]]
     except Exception:
         return False
-    if not np.allclose(ta, tb, atol=atol, rtol=1e-6):
+    if not np.allclose(ta, tb, atol=atol, rtol=0):
         return False
     if a.crs is not None and b.crs is not None:
         try:
@@ -612,17 +629,24 @@ def reproject_scene_to(src: "Scene", dst_ref: "Scene") -> "Scene":
     shape = dst_ref.shape
     bands: Dict[str, np.ndarray] = {}
     first = next(iter(src.bands.values()))
+    warped_quality: Dict[str, np.ndarray] = {}
+    source_quality = src.meta.get("spectral_band_valid") or {}
     for name, band in src.bands.items():
-        bands[name] = reproject_array(
-            band,
-            src.transform,
-            src.crs,
-            dst_ref.transform,
-            shape,
-            dst_ref.crs,
-            resampling="bilinear",
-            dst_nodata=0.0,
-        ).astype(np.float32)
+        good = np.isfinite(band)
+        if name in source_quality:
+            good &= np.asarray(source_quality[name], dtype=bool)
+        if src.nodata_mask is not None:
+            good &= ~np.asarray(src.nodata_mask, dtype=bool)
+        def warp(values, method):
+            return reproject_array(values, src.transform, src.crs, dst_ref.transform,
+                                   shape, dst_ref.crs, resampling=method, dst_nodata=0.0)
+        numerator = warp(np.where(good, band, 0.0).astype(np.float32), "bilinear")
+        weight = warp(good.astype(np.float32), "bilinear")
+        valid = (warp(good.astype(np.float32), "nearest") >= 0.5) & (weight > 1e-6)
+        out = np.zeros(shape, dtype=np.float32)
+        np.divide(numerator, weight, out=out, where=valid)
+        bands[name] = out
+        warped_quality[name] = valid
 
     # 必须显式产出"重投影后的无效像元掩膜"。
     # 波段在源覆盖范围外被填成 0.0，而 0 反射率本身是合法值，无法据此区分
@@ -644,6 +668,7 @@ def reproject_scene_to(src: "Scene", dst_ref: "Scene") -> "Scene":
     )
     nodata = covered < 0.5
     meta = dict(src.meta)
+    meta["spectral_band_valid"] = warped_quality
     # SCL must follow the same spatial transformation as the spectral bands.
     # Keeping the old array can silently move clouds onto unrelated pixels even
     # when both scenes happen to have the same dimensions.

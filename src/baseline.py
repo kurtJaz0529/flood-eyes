@@ -143,23 +143,34 @@ def predict(
     meta : 阈值等诊断信息
     """
     ndwi = np.asarray(ndwi, dtype=np.float32)
+    if nodata_mask is not None:
+        if np.asarray(nodata_mask).shape != ndwi.shape:
+            raise ValueError("无效掩膜与指数尺寸不一致")
+        ndwi = np.where(nodata_mask, np.nan, ndwi)
     h, w = ndwi.shape
     meta: Dict[str, Any] = {"method": method, "softness": float(softness)}
 
     # ---- 退化场景：整景指数几乎无变化（全陆/全水/云覆盖）----
     finite = ndwi[np.isfinite(ndwi)]
     std = float(finite.std()) if finite.size else 0.0
-    if std < 1e-4:
+    if std < 1e-4 and fixed_threshold is None:
         const = float(finite.mean()) if finite.size else 0.0
         is_water = const > 0.1  # NDWI > 0.1 才认为整景为水
         prob = np.full(ndwi.shape, 1.0 if is_water else 0.0, dtype=np.float32)
+        if nir is not None:
+            if np.asarray(nir).shape != ndwi.shape:
+                raise ValueError("近红外影像尺寸与指数不一致")
+            prob *= _sigmoid((nir_max - np.asarray(nir)) / max(nir_softness, 1e-3))
+            meta["nir_gate"] = float(nir_max)
+        prob[~np.isfinite(ndwi)] = 0.0
         if nodata_mask is not None:
             prob[nodata_mask] = 0.0
         mask = prob > 0.5
         meta.update(
             {
                 "threshold_source": "no_signal",
-                "threshold_global": const,
+                "threshold_global": 0.1,
+                "constant_index": const,
                 "note": f"水体指数几乎无空间变化（std={std:.2e}，均值={const:.3f}）",
                 "water_fraction_raw": float(np.count_nonzero(mask)) / max(mask.size, 1),
             }
@@ -207,6 +218,7 @@ def predict(
         meta["nir_gate_rejected_pct"] = 100.0 * float(np.count_nonzero(gate < 0.5)) / max(gate.size, 1)
 
     prob = np.clip(prob, 0.0, 1.0).astype(np.float32)
+    prob[~np.isfinite(prob) | ~np.isfinite(ndwi)] = 0.0
     if nodata_mask is not None:
         prob[nodata_mask] = 0.0
 

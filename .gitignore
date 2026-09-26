@@ -35,6 +35,12 @@ build/flood_eyes/
 build/*.toc
 build/*.pkg
 
+# ---- 打包中间目录（含 PyInstaller 缓存与调试版产物）----
+dist_dbg/
+dist_dbg2/
+build/_*/
+build/_prev_*/
+
 # ---- 系统/编辑器 ----
 .DS_Store
 Thumbs.db

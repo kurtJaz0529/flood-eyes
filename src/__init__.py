@@ -31,7 +31,7 @@ except Exception as _exc:  # pragma: no cover
     TORCH_AVAILABLE = False
     TORCH_ERROR = f"{type(_exc).__name__}: {_exc}"
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = [
     "FloodDetector",
     "FloodResult",

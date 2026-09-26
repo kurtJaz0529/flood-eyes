@@ -21,8 +21,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Dict
 
-SCHEMA_VERSION = 1
-TERRAIN_PROFILES = ("unspecified", "plain", "hilly", "mountain", "urban", "coastal")
+SCHEMA_VERSION = 2
+TERRAIN_PROFILES = ("unspecified", "plain", "hilly", "mountain", "urban", "coastal", "wetland", "arid")
 MIN_SIZE, MAX_SIZE = 64, 4096
 _REQUIRED = ("lon", "lat", "pre_start", "pre_end", "post_start", "post_end")
 
@@ -64,6 +64,11 @@ class PipelineRequest:
     terrain_profile: str = "unspecified"
     max_cloud_pct: float = 35.0
     min_valid_pct: float = 50.0
+    detection_strategy: str = "baseline"
+    water_index: str = "auto"
+    index_threshold: float | None = None
+    slope_threshold_deg: float = 15.0
+    band_order: str = "auto"
 
     def __post_init__(self) -> None:
         lon = _number(self.lon, "lon")
@@ -78,6 +83,24 @@ class PipelineRequest:
             raise ValueError(f"size 需在 {MIN_SIZE}..{MAX_SIZE}：{self.size}")
         if self.terrain_profile not in TERRAIN_PROFILES:
             raise ValueError(f"terrain_profile 非法：{self.terrain_profile!r}")
+        if self.detection_strategy not in ("baseline", "adaptive"):
+            raise ValueError("detection_strategy 需为 baseline/adaptive")
+        if self.water_index not in ("auto", "ndwi", "mndwi"):
+            raise ValueError("water_index 需为 auto/ndwi/mndwi")
+        from src.preprocess import BAND_ORDERS
+        if self.band_order not in ("auto", *BAND_ORDERS):
+            raise ValueError("未知 band_order")
+        slope = _number(self.slope_threshold_deg, "slope_threshold_deg")
+        if not 0 <= slope <= 90:
+            raise ValueError("slope_threshold_deg 需在 0..90")
+        object.__setattr__(self, "slope_threshold_deg", slope)
+        if self.index_threshold is not None:
+            threshold = _number(self.index_threshold, "index_threshold")
+            if not -1 <= threshold <= 1:
+                raise ValueError("index_threshold 需在 -1..1")
+            object.__setattr__(self, "index_threshold", threshold)
+        if self.detection_strategy == "baseline" and (self.water_index != "auto" or self.index_threshold is not None):
+            raise ValueError("water_index/index_threshold 自定义需要 detection_strategy=adaptive")
         cloud = _number(self.max_cloud_pct, "max_cloud_pct")
         valid = _number(self.min_valid_pct, "min_valid_pct")
         for name, pct in (("max_cloud_pct", cloud), ("min_valid_pct", valid)):

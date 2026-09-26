@@ -310,6 +310,15 @@ def _export_gis_layers(result: Any, workdir: str, files: Dict[str, str]) -> Dict
         os.path.join(workdir, "valid_mask.tif"), valid.astype(np.uint8), scene, nodata=None
     )
     info["written"] += ["water_mask.tif", "valid_mask.tif"]
+    for key, filename in (("review_mask", "review.tif"), ("before_review_mask", "before_review.tif")):
+        review = result.meta.get(key)
+        if review is not None:
+            review = np.asarray(review)
+            if review.shape != shape or set(np.unique(review).tolist()) - set(range(8)) - {255}:
+                raise ValueError("复核掩膜形状/取值不合法，拒绝写出成果")
+            files[key + "_tif"] = _write_uint8_tif(
+                os.path.join(workdir, filename), review.astype(np.uint8), scene, nodata=255)
+            info["written"].append(filename)
 
     if getattr(result, "change", None):
         change_cls = _change_class_array(result.change, shape)

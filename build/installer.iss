@@ -7,8 +7,11 @@
 ;   · 安装完可选择立即启动
 ;
 ; 编译（两种版本）：
-;   ISCC.exe /DProfile=lite build\installer.iss    -> 慧眼识灾_安装程序_v0.4.0_精简版.exe
-;   ISCC.exe /DProfile=full build\installer.iss    -> 慧眼识灾_安装程序_v0.4.0_完整版.exe
+;   ISCC.exe /DProfile=lite build\installer.iss    -> 慧眼识灾_安装程序_v0.5.0_精简版.exe
+;   ISCC.exe /DProfile=full build\installer.iss    -> 慧眼识灾_安装程序_v0.5.0_完整版.exe
+;
+; 测试编译（不覆盖本机已装版本的卸载登记）：
+;   ISCC.exe /DProfile=lite /DAppIdValue={{测试专用GUID} build\installer.iss
 ;
 ; 也可以用 build/build_installer.ps1 一键编译。
 
@@ -23,17 +26,20 @@
 #else
   #define SourceDir "..\dist\慧眼识灾"
   #define EditionName "精简版"
-  #define EditionNote "NDWI + Otsu 基线（启动快、体积小）"
+  #define EditionNote "场景适配洪水识别与六种光谱监测（无需 GPU）"
 #endif
 
 #define AppName "慧眼识灾"
-#define AppVersion "0.4.0"
+#define AppVersion "0.5.0"
+#ifndef AppIdValue
+  #define AppIdValue "{{8F3C2A41-6D2B-4E7A-9C15-1B7E4F0A2D33}"
+#endif
 #define AppPublisher "慧眼识灾团队"
 #define AppExeName "慧眼识灾.exe"
 
 [Setup]
 ; AppId 固定，保证升级时能覆盖安装而不是并存两份
-AppId={{8F3C2A41-6D2B-4E7A-9C15-1B7E4F0A2D33}
+AppId={#AppIdValue}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} V{#AppVersion}（{#EditionName}）
@@ -91,8 +97,4 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "立即启动 {#AppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; 卸载时清掉运行产生的数据
-Type: filesandordirs; Name: "{app}\outputs"
-Type: filesandordirs; Name: "{app}\logs"
-Type: filesandordirs; Name: "{app}\_internal"
+; 仅卸载安装清单中的应用文件。运行产生的成果、日志与用户权重保留。

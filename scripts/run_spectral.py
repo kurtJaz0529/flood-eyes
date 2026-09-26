@@ -12,11 +12,22 @@
         --images a.tif b.tif --min-valid-pct 15 \
         --dates 2020-01-01 2020-02-01
 
-支持的指数（严格要求真实波段，禁止无 NIR 代理）：
+    python scripts/run_spectral.py --index nbr --band-order s2_6band \
+        --images pre.tif post.tif --out-dir outputs/nbr
 
-    ndvi = (nir - red) / (nir + red)
-    savi = 1.5 * (nir - red) / (nir + red + 0.5)
-    ndwi = (green - nir) / (green + nir)
+支持的指数（严格要求真实波段，禁止代理波段；缺真实 SWIR 必须失败）：
+
+    ndvi  = (nir - red) / (nir + red)
+    savi  = 1.5 * (nir - red) / (nir + red + 0.5)
+    ndwi  = (green - nir) / (green + nir)
+    mndwi = (green - swir1) / (green + swir1)
+    ndmi  = (nir - swir1) / (nir + swir1)
+    nbr   = (nir - swir2) / (nir + swir2)
+
+mndwi / ndmi / nbr 需要真实 SWIR 波段（Sentinel-2 B11/B12），须用
+``--band-order s2_6band`` 显式声明 B2 B3 B4 B8 B11 B12 顺序；四波段影像
+无法计算这些指数。所有指数的相邻差值统一为"后一时相 − 前一时相"（后减前）；
+NBR 的相邻差值不是传统 dNBR（火前 − 火后），符号相反，不套用 dNBR 分级阈值。
 
 日期只能由 ``--dates`` 显式提供，否则所有场景标记为 ``unverified``；
 **绝不从文件名推断日期**。全部场景相对首景对齐；缺 CRS/transform 会直接报错。
@@ -54,13 +65,17 @@ _EXAMPLE = (
     "--min-valid-pct 15\n"
     "  python scripts/run_spectral.py --index ndwi --images a.tif b.tif "
     "--dates 2020-01-01 2020-02-01\n"
+    "  python scripts/run_spectral.py --index ndmi --band-order s2_6band "
+    "--images a.tif b.tif --out-dir outputs/ndmi\n"
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "本地 GeoTIFF 多时相光谱监测：计算 ndvi/savi/ndwi 并按相邻两景统计变化。"
+            "本地 GeoTIFF 多时相光谱监测：计算 "
+            "ndvi/savi/ndwi/mndwi/ndmi/nbr 并按相邻两景统计变化。"
+            "相邻差值统一为后一时相减前一时相；NBR 差值不是传统 dNBR。"
         ),
         epilog=_EXAMPLE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -69,7 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--index",
         required=True,
         choices=list(supported_indices()),
-        help="光谱指数：ndvi / savi / ndwi",
+        help=(
+            "光谱指数：ndvi / savi / ndwi / mndwi / ndmi / nbr；"
+            "mndwi/ndmi/nbr 需要真实 SWIR（swir1=B11, swir2=B12）"
+        ),
     )
     parser.add_argument(
         "--images",
@@ -102,7 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--band-order",
         default="auto",
-        help="传给 load_scene 的波段顺序（默认 auto，按波段描述/通道数解析）",
+        help=(
+            "传给 load_scene 的波段顺序（默认 auto，按波段描述/通道数解析）。"
+            "SWIR 指数需正确波段描述或显式预设，如 s2_6band"
+            "（B2 B3 B4 B8 B11 B12）"
+        ),
     )
     return parser
 

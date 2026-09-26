@@ -18,7 +18,7 @@ import glob
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -120,6 +120,8 @@ class FloodResult:
                     f"【双时相】灾前 {c['before_water_km2']:,.2f} km² → 灾后 {c['after_water_km2']:,.2f} km²，"
                     f"新增淹没 {c['new_water_km2']:,.2f} km²，退水 {c['receded_water_km2']:,.2f} km²。"
                 )
+        if self.meta.get("adaptive"):
+            lines.append(f"【需复核】{self.stats.get('review_area_km2', 0):.3f} km²；已从水陆判定及变化统计中排除，详见 review.tif。场景配方尚需区域真值验证。")
         return "\n".join(lines)
 
     def to_json(self, indent: int = 2) -> str:
@@ -163,8 +165,36 @@ class FloodDetector:
         min_water_area_km2: float = 0.0,
         mask_clouds: bool = True,
         max_cloud_pct: float = 35.0,
+        detection_strategy: str = "baseline",
+        terrain_profile: str = "unspecified",
+        water_index: str = "auto",
+        index_threshold: Optional[float] = None,
+        dem_path: Optional[str] = None,
+        slope_threshold_deg: float = 15.0,
     ):
+        from .terrain import terrain_context
+        terrain_profile = terrain_context(terrain_profile)["profile"]
+        if detection_strategy not in ("baseline", "adaptive"):
+            raise ValueError("detection_strategy 需为 baseline/adaptive")
+        if water_index not in ("auto", "ndwi", "mndwi"):
+            raise ValueError("water_index 需为 auto/ndwi/mndwi")
+        if index_threshold is not None and (not np.isfinite(index_threshold) or not -1 <= index_threshold <= 1):
+            raise ValueError("index_threshold 需在 -1..1")
+        if not np.isfinite(slope_threshold_deg) or not 0 <= slope_threshold_deg <= 90:
+            raise ValueError("slope_threshold_deg 需在 0..90")
+        if detection_strategy == "adaptive" and mode == "unet":
+            raise ValueError("场景适配当前仅支持光谱基线")
+        if detection_strategy == "baseline" and (water_index != "auto" or index_threshold is not None):
+            raise ValueError("自定义 water_index/index_threshold 需要 detection_strategy=adaptive")
+        self.detection_strategy = detection_strategy
+        self.terrain_profile = terrain_profile
+        self.water_index = water_index
+        self.index_threshold = index_threshold
+        self.dem_path = dem_path
+        self.slope_threshold_deg = slope_threshold_deg
         self.mode = mode
+        if detection_strategy == "adaptive":
+            self.mode = "baseline"
         self.weights = weights
         self.device = resolve_device(device)
         self.pixel_size_m = None if pixel_size_m is not None and float(pixel_size_m) <= 0 else pixel_size_m
@@ -307,11 +337,28 @@ class FloodDetector:
                 nir_path=nir_path,
                 pixel_size_m=self.pixel_size_m,
             )
+            if self.detection_strategy == "adaptive":
+                from .spectral_monitor import _quality_sidecar
+                scene.meta["quality_sidecar"] = _quality_sidecar(image_path, scene)
         return self.detect_scene(scene)
 
-    def detect_scene(self, scene: Scene) -> FloodResult:
+    def detect_scene(self, scene: Scene, *, _paired_index=None, _pair_warnings=()) -> FloodResult:
         t0 = time.perf_counter()
-        warnings: List[str] = []
+        warnings: List[str] = list(_pair_warnings)
+        adaptive = self.detection_strategy == "adaptive"
+        chosen_index = None
+        if adaptive:
+            from .adaptive_flood import select_index
+            from .spectral_monitor import metric_pixel_area_m2
+            area, note = metric_pixel_area_m2(scene.transform, scene.crs)
+            if area is None:
+                raise ValueError(f"场景适配面积统计要求米制投影 GeoTIFF：{note}")
+            scene = replace(scene, pixel_size_m=float(np.sqrt(area)))
+            chosen_index, selection_warnings = select_index(
+                self.terrain_profile, [scene], _paired_index or self.water_index)
+            warnings.extend(selection_warnings)
+            if scene.meta.get("scl") is None:
+                warnings.append("缺少 SCL 云/云影质量层：当前仅使用光谱云估计，阴影和雪冰筛除未充分核验。")
         if not scene.has_nir:
             warnings.append("影像缺少近红外波段，基线使用 (绿-红) 代理指数，精度会下降")
         nodata = scene.nodata_mask
@@ -335,8 +382,12 @@ class FloodDetector:
         # 单景可观测区：波段有限 + 非无数据 + 被剔除的云（mask_clouds 时）+ SCL 0/1/11
         # （SCL 0=无数据、1=饱和/缺陷、11=雪冰，与云无关，始终剔除）
         valid_mask = np.ones(scene.shape, dtype=bool)
-        for band in scene.bands.values():
+        for name in scene.channel_names:
+            band = scene.bands[name]
             valid_mask &= np.isfinite(band)
+            band_valid = (scene.meta.get("spectral_band_valid") or {}).get(name)
+            if band_valid is not None:
+                valid_mask &= np.asarray(band_valid, dtype=bool)
         if scene.nodata_mask is not None:
             nm = np.asarray(scene.nodata_mask, dtype=bool)
             if nm.shape == scene.shape:
@@ -355,7 +406,17 @@ class FloodDetector:
         if mode == "unet" and not use_unet and self._load_error:
             warnings.append(self._load_error)
 
-        if use_unet:
+        if adaptive:
+            from .adaptive_flood import predict, morphology
+            prob, meta, valid_mask = predict(
+                scene, self.terrain_profile, valid_mask, index=chosen_index,
+                fixed_threshold=self.index_threshold, softness=self.softness,
+                dem_path=self.dem_path, slope_threshold_deg=self.slope_threshold_deg,
+            )
+            invalid = ~valid_mask
+            warnings.extend(meta.pop("adaptive_warnings"))
+            model_label = f"场景适配 {chosen_index.upper()} + 证据复核"
+        elif use_unet:
             prob, meta = self._predict_unet(scene, warnings)
             model_label = f"U-Net ({self._model_meta.get('arch', '?')})"
         else:
@@ -373,12 +434,14 @@ class FloodDetector:
             model_label = meta["model_label"]
 
         # 后处理
+        clean_params = dict(open_radius=self.open_radius, close_radius=self.close_radius,
+                            min_area_px=self.min_area_px, fill_holes=self.fill_holes)
+        if adaptive:
+            clean_params = morphology(self.terrain_profile, **clean_params)
+            meta["adaptive"]["morphology"] = clean_params
         mask = postprocess.clean_mask(
             prob >= (self.threshold if use_unet else 0.5),
-            open_radius=self.open_radius,
-            close_radius=self.close_radius,
-            min_area_px=self.min_area_px,
-            fill_holes=self.fill_holes,
+            **clean_params,
             max_hole_px=self.max_hole_px,
         )
         mask = mask & valid_mask
@@ -391,6 +454,9 @@ class FloodDetector:
         stats["observable_area_km2"] = observable_px * px_km2
         stats["observable_fraction_pct"] = 100.0 * observable_px / max(int(valid_mask.size), 1)
         stats["quality_status"] = "ok" if observable_px > 0 else "data_insufficient"
+        if adaptive:
+            stats["review_pixels"] = meta["adaptive"]["review_pixels"]
+            stats["review_area_km2"] = stats["review_pixels"] * px_km2
 
         if self.min_water_area_km2 > 0 and stats["largest_area_km2"] < self.min_water_area_km2:
             warnings.append(
@@ -410,12 +476,14 @@ class FloodDetector:
                 "source": os.path.basename(scene.path) if scene.path else "in-memory",
                 "shape": list(scene.shape),
                 "nir_available": scene.has_nir,
+                "detection_strategy": self.detection_strategy,
                 "cloud_pct": cloud_pct,
                 "cloud_source": scene.meta.get("scl_source") or "heuristic",
                 "valid_fraction_pct": round(stats["observable_fraction_pct"], 2),
                 "quality_status": stats["quality_status"],
                 "boa_offset": scene.meta.get("boa_offset", 0),
                 "band_map": scene.meta.get("band_map"),
+                "quality_sidecar": scene.meta.get("quality_sidecar"),
                 "warnings": warnings,
                 "params": {
                     "min_area_px": self.min_area_px,
@@ -506,6 +574,11 @@ class FloodDetector:
             )
 
         aligned = False
+        if self.detection_strategy == "adaptive":
+            from .spectral_monitor import _quality_sidecar
+            for source in (before_scene, after_scene):
+                if source.path and os.path.isfile(source.path):
+                    source.meta["quality_sidecar"] = _quality_sidecar(source.path, source)
         geo_ok = (
             before_scene.transform is not None
             and after_scene.transform is not None
@@ -521,8 +594,17 @@ class FloodDetector:
                 "且缺少地理参考无法自动对齐，请先裁剪到同一范围"
             )
 
-        before = self.detect_scene(before_scene)
-        after = self.detect_scene(after_scene)
+        paired_index, pair_warnings = None, []
+        if self.detection_strategy == "adaptive":
+            from .adaptive_flood import select_index
+            paired_index, pair_warnings = select_index(
+                self.terrain_profile, [before_scene, after_scene], self.water_index)
+        before = self.detect_scene(before_scene, _paired_index=paired_index, _pair_warnings=pair_warnings)
+        after = self.detect_scene(after_scene, _paired_index=paired_index, _pair_warnings=pair_warnings)
+        if self.detection_strategy == "adaptive":
+            after.meta["before_review_mask"] = before.meta["review_mask"]
+            after.meta["before_adaptive"] = before.meta["adaptive"]
+            after.meta["warnings"] = list(dict.fromkeys(before.meta["warnings"] + after.meta["warnings"]))
         if aligned:
             after.meta.setdefault("warnings", []).append("灾后影像已重投影到灾前网格后再对比")
 

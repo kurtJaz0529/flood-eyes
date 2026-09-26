@@ -65,7 +65,7 @@
 | **请求契约与缓存身份** | 一次处理请求（坐标、灾前灾后四个日期、窗口、地形档案、云量/最小有效比例）冻结为 `PipelineRequest`，全字段 + schema 版本取 SHA256 作为缓存键；任一字段变化就换键，不会误用别人的结果 |
 | **可恢复流水线** | acquire / detect / export 分阶段原子写 manifest（完整请求、输入哈希、工件与成果哈希）；同一 `run_id` 重跑先校验身份与成果，一致直接复用，身份不符拒绝覆盖 |
 | **共同有效区统计** | 单景 `valid_mask`（波段有限 + 非 NoData + 剔除云 + SCL 0/1/11）；变化只在灾前/灾后**共同有效区**内计算——"灾前有云、灾后有水"不再被算成新增淹没；数据不足时明确回报，而不是输出"零淹没" |
-| **地形地貌档案** | 平原 / 丘陵 / 山地 / 城市 / 海岸 作为**用户声明的判读语境**（绝不据此修改水体阈值）；可选本地 DEM，输出坡度风险栅格供人工复核，NoData 不当零坡度 |
+| **地形地貌档案** | 原有基线按用户声明场景提示复核；新增可选场景适配策略，支持平原 / 丘陵 / 山地 / 城市 / 海岸 / 湿地稻田 / 干旱裸地，详见下节 |
 | **GIS 成果** | 成果包内含 `water_mask.tif` / `valid_mask.tif` / `change.tif` / `terrain_risk.tif`，与源影像同 CRS、transform，可直接导入 GIS |
 | **批量任务** | SQLite 任务库 + 串行 worker；CSV/JSON 逐行校验导入（坏行只报错、不影响好行）、失败重试、显式恢复、取消排队；命令行 `scripts/run_batch.py --list/--run/--retry/--cancel/--recover` |
 
@@ -73,13 +73,21 @@
 
 ## 🌿 本地多时相光谱监测
 
-新增独立命令行流程，可对按时间顺序排列的多景本地 GeoTIFF 计算 **NDVI 植被绿度、SAVI 稀疏植被绿度或绿光/近红外 NDWI 地表水指数**，自动配准、筛除无效像元、计算相邻时相差值并导出 GIS 栅格和 JSON 摘要。低质量时相和共同有效区不足会标为缺测；连续指数变化不直接等同于灾损或淹没面积。
+新增本地工作流，可对按时间顺序排列的多景 GeoTIFF 计算 **NDVI/SAVI 植被绿度、NDWI/MNDWI 地表水、NDMI 植被水分、NBR 火烧敏感指数**，自动配准、筛除无效像元、计算相邻时相差值并导出 GIS 栅格和 JSON 摘要。低质量时相和共同有效区不足会标为缺测；连续指数变化不直接等同于灾损或淹没面积。
 
 ```powershell
 python scripts/run_spectral.py --index ndvi --images data/samples/demo01_pre.tif data/samples/demo01_post.tif
 ```
 
-这两景是合成样本，仅用于检查流程。完整参数、质量口径与结果说明见 [光谱时序监测使用说明](docs/光谱时序监测使用说明.md)。这项本地工作流目前独立于在线选景和洪水批量队列。
+这两景是合成样本，仅用于检查流程。完整参数、质量口径与结果说明见 [光谱时序监测使用说明](docs/光谱时序监测使用说明.md)。网页中的“多时相遥感监测”也可运行此流程并下载成果包；它目前独立于在线选景和洪水批量队列。MNDWI/NDMI/NBR 必须另备真实 SWIR，不能用在线下载的四波段替代。
+
+## 场景适配洪水识别（2026-09-26，实验配方）
+
+网页选择“识别策略 → 场景适配”和地貌，可上传本地灾前/灾后影像及 DEM；批量任务设置 `detection_strategy=adaptive`。城市、海岸、干旱裸地优先 MNDWI；山地/丘陵使用局部阈值及可选 DEM，城市/山地在波段齐全时交叉核查 AWEI 阴影证据；湿地、街道与窄河道保留较细水域。两期缺 SWIR 时自动模式统一降级 NDWI 并说明原因；显式要求 MNDWI 则直接报错。
+
+可疑水体在 `review.tif` / `before_review.tif` 中给出复核原因，在水体和变化栅格中为未知（255），不作为无水像元。默认配方尚未作区域标定，不能据此宣称真实精度已提高。新增 `scripts/evaluate_flood.py` 可使用独立真值计算 Precision/Recall/F1/IoU 并同时报告覆盖率。
+
+完整场景规则、批量示例、参数标定和精度验收见 [场景适配与遥感扩展使用说明](docs/场景适配与遥感扩展使用说明.md)。GPT 负责关键设计与验收，WorkBuddy 的 DeepSeek V4.1 Flash 协助有界实现；协作规则见 [AGENTS.md](AGENTS.md)。
 
 ## 🚀 30 秒跑起来
 
@@ -131,8 +139,8 @@ python train.py --data data/sen1floods11 --epochs 60 --img-size 512 `
 
 | 安装包 | 体积 | 内容 |
 |---|---|---|
-| `慧眼识灾_安装程序_v0.2.0_精简版.exe` | **174.6 MB** | NDWI + Otsu 基线，启动快 |
-| `慧眼识灾_安装程序_v0.2.0_完整版.exe` | **351.9 MB** | 额外含 PyTorch + U-Net |
+| `慧眼识灾_安装程序_v0.5.0_精简版.exe` | **143.9 MB** | 场景适配洪水识别 + 六种光谱监测，无需 GPU |
+| `慧眼识灾_安装程序_v0.5.0_完整版.exe` | 待重建 | 额外含 PyTorch + U-Net |
 
 别人拿到后：**双击 setup.exe → 下一步 → 完成 → 开始菜单/桌面点「慧眼识灾」直接用**。
 无需管理员权限、无需装 Python、无需联网；卸载走「添加或删除程序」。
@@ -149,8 +157,8 @@ powershell -ExecutionPolicy Bypass -File build/build_installer.ps1
 
 | 版本 | 解压后 | 分发包(zip) | 适用 |
 |---|---|---|---|
-| 精简版 | 427 MB | **229 MB** | 现场演示、U 盘分发 |
-| 完整版 | 878 MB | **401 MB** | 算法评测、需要深度模型 |
+| 精简版 v0.5.0 | 408 MB | **185.5 MB** | 现场演示、U 盘分发 |
+| 完整版 | 待重建 | 待重建 | 算法评测、需要深度模型（含 PyTorch） |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile lite   # 产物 dist/

@@ -138,6 +138,10 @@ hiddenimports += [
 
 # 7) 项目自身模块（函数内 import，显式兜底）
 hiddenimports += ["app", "app.main", "app.components", "app.desktop", "src"]
+hiddenimports += ["app.automation", "app.spectral", "src.adaptive_flood",
+                  "src.spectral_monitor", "src.evaluation", "src.jobs", "src.pipeline"]
+for name in ("场景适配与遥感扩展使用说明.md", "光谱时序监测使用说明.md", "自动化处理使用说明.md"):
+    datas.append((os.path.join(ROOT, "docs", name), "docs"))
 
 # --------------------------------------------------------------------------
 # 排除（显著减小体积）

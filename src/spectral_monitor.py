@@ -6,11 +6,14 @@
 本模块复用既有 ``src.preprocess.load_scene`` 读取影像；配准时逐波段排除
 NoData 对邻近像元的影响。不改动洪水识别流水线，不联网。
 
-指数与所需真实波段（禁止用无 NIR 的代理波段）::
+指数与所需真实波段（禁止用代理波段，缺真实 SWIR 必须失败）::
 
-    ndvi = (nir - red) / (nir + red)                需要 nir, red
-    savi = 1.5 * (nir - red) / (nir + red + 0.5)    需要 nir, red
-    ndwi = (green - nir) / (green + nir)            需要 green, nir
+    ndvi  = (nir - red) / (nir + red)                需要 nir, red
+    savi  = 1.5 * (nir - red) / (nir + red + 0.5)    需要 nir, red
+    ndwi  = (green - nir) / (green + nir)            需要 green, nir
+    mndwi = (green - swir1) / (green + swir1)        需要 green, swir1
+    ndmi  = (nir - swir1) / (nir + swir1)            需要 nir, swir1
+    nbr   = (nir - swir2) / (nir + swir2)            需要 nir, swir2
 
 关键约定
 --------
@@ -19,6 +22,9 @@ NoData 对邻近像元的影响。不改动洪水识别流水线，不联网。
   SCL sidecar 不属于 ``{0, 1, 3, 8, 9, 10, 11}``
   （0=NoData 1=饱和/缺陷 3=云影 8/9=云 10=卷云 11=雪/冰）。
 * 指数差值只在相邻两景的**共同有效区**计算。
+* 所有指数的相邻差值统一为**后一时相 − 前一时相**（后减前）。NBR 的相邻差值
+  **不是传统 dNBR**（传统 dNBR 为"火前 − 火后"，符号相反），不得直接套用
+  dNBR 分级阈值；本工具只报告连续指数与相邻差值，不输出火烧等级或干旱面积。
 * 每景及相邻两景共同区均使用 ``min_valid_pct`` 门禁；未过门禁时，
   均值/共同有效面积报告为 ``null``（status=missing/insufficient），绝不写成 0。
 * 栅格输出：每景指数 ``float32``（无效 -9999）、相邻差值 ``float32``
@@ -52,6 +58,9 @@ INDEX_FORMULAS: Dict[str, str] = {
     "ndvi": "(nir - red) / (nir + red)",
     "savi": "1.5 * (nir - red) / (nir + red + 0.5)",
     "ndwi": "(green - nir) / (green + nir)",
+    "mndwi": "(green - swir1) / (green + swir1)",
+    "ndmi": "(nir - swir1) / (nir + swir1)",
+    "nbr": "(nir - swir2) / (nir + swir2)",
 }
 
 #: 指数 -> 严格需要的真实波段（不允许替代波段）
@@ -59,7 +68,23 @@ REQUIRED_BANDS: Dict[str, Tuple[str, ...]] = {
     "ndvi": ("nir", "red"),
     "savi": ("nir", "red"),
     "ndwi": ("green", "nir"),
+    "mndwi": ("green", "swir1"),
+    "ndmi": ("nir", "swir1"),
+    "nbr": ("nir", "swir2"),
 }
+
+#: 所有指数相邻差值的方向口径：后一时相减前一时相。
+CHANGE_DIRECTION: str = "later_minus_earlier"
+CHANGE_DIRECTION_NOTE: str = (
+    "所有指数的相邻差值统一为“后一时相 − 前一时相”（后减前，right − left）。"
+    "NBR 的相邻差值不是传统 dNBR：传统 dNBR 一般为“火前 − 火后”（前减后），"
+    "两者符号相反，不能直接套用既有 dNBR 分级阈值。"
+    "本工具只报告连续指数与相邻差值，不输出火烧等级/严重度分级，也不输出干旱面积。"
+)
+_DNBR_NOTE: str = (
+    "NBR 相邻差值为“后 − 前”；传统 dNBR = 火前 NBR − 火后 NBR（前 − 后），"
+    "与本工具符号相反。禁止把本差值当作 dNBR 使用或套用 dNBR 分级阈值。"
+)
 
 #: SCL 中视为"不可用"的类别。有效类别为其补集（2/4/5/6/7）。
 SCL_INVALID_CLASSES: Tuple[int, ...] = (0, 1, 3, 8, 9, 10, 11)
@@ -152,7 +177,7 @@ def _require_arrays(bands: Mapping[str, Any], index: str) -> Dict[str, np.ndarra
         raise ValueError(
             f"指数 {index} 严格要求真实波段 {list(REQUIRED_BANDS[index])}，"
             f"当前缺少 {missing}（可用波段：{sorted(bands)}）。"
-            "禁止使用无 NIR 的代理波段或其他替代波段。"
+            "禁止使用代理波段或其他替代波段；SWIR 指数缺真实 swir1/swir2 时必须失败。"
         )
     shapes = {arr.shape for arr in arrays.values()}
     if len(shapes) != 1:
@@ -169,11 +194,28 @@ def _terms_from_arrays(arrays: Mapping[str, np.ndarray], index: str) -> Tuple[np
         if index == "savi":
             num = np.float32(1.5) * num
             den = den + np.float32(0.5)
-    else:  # ndwi
+    elif index == "ndwi":
         green = arrays["green"]
         nir = arrays["nir"]
         num = green - nir
         den = green + nir
+    elif index == "mndwi":
+        green = arrays["green"]
+        swir1 = arrays["swir1"]
+        num = green - swir1
+        den = green + swir1
+    elif index == "ndmi":
+        nir = arrays["nir"]
+        swir1 = arrays["swir1"]
+        num = nir - swir1
+        den = nir + swir1
+    elif index == "nbr":
+        nir = arrays["nir"]
+        swir2 = arrays["swir2"]
+        num = nir - swir2
+        den = nir + swir2
+    else:  # pragma: no cover - _normalize_index 已保证可达性
+        raise ValueError(f"指数 {index} 没有分子/分母定义，请同步 INDEX_FORMULAS")
     return (
         np.asarray(num, dtype=np.float32),
         np.asarray(den, dtype=np.float32),
@@ -402,7 +444,7 @@ def load_scenes(
             raise ValueError(
                 f"场景 {os.path.basename(path)} 缺少指数 {key} 所需真实波段 {missing}"
                 f"（解析出：{sorted(scene.bands)}）。"
-                "禁止使用无 NIR 的代理波段或其他替代波段。"
+                "禁止使用代理波段或其他替代波段；SWIR 指数必须使用真实 swir1/swir2 反射率。"
             )
         band_map = scene.meta.get("band_map") or {}
         with rasterio.open(path) as ds:
@@ -784,11 +826,12 @@ def run_monitor(
     参数
     ----
     images : 本地 GeoTIFF 路径序列（按时间先后给出）
-    index : ``ndvi`` / ``savi`` / ``ndwi``
+    index : ``ndvi`` / ``savi`` / ``ndwi`` / ``mndwi`` / ``ndmi`` / ``nbr``
     out_dir : 输出目录
     min_valid_pct : 单景及相邻共同有效比例门禁（0~100）
     dates : 可选，与 ``images`` 等长的日期字符串；缺省则标记 unverified
-    band_order : 传给 ``load_scene`` 的波段顺序，默认 ``auto``
+    band_order : 传给 ``load_scene`` 的波段顺序，默认 ``auto``；
+        SWIR 指数需显式指定含 swir1/swir2 的预设（如 ``s2_6band``）
     """
     key = _normalize_index(index)
     if isinstance(images, (str, os.PathLike)):
@@ -880,6 +923,10 @@ def run_monitor(
         "index": key,
         "formula": INDEX_FORMULAS[key],
         "required_bands": list(REQUIRED_BANDS[key]),
+        "change_direction": CHANGE_DIRECTION,
+        "change_direction_note": CHANGE_DIRECTION_NOTE,
+        "fire_severity_grades_provided": False,
+        "drought_area_provided": False,
         "min_valid_pct": threshold,
         "scl_invalid_classes": list(SCL_INVALID_CLASSES),
         "invalid_nodata": INDEX_NODATA,
@@ -913,6 +960,9 @@ def run_monitor(
         "warnings": global_warnings,
     }
 
+    if key == "nbr":
+        summary["dnbr_note"] = _DNBR_NOTE
+
     summary_path = os.path.join(out_dir, "summary.json")
     summary["summary_json"] = summary_path
     temp_path = summary_path + f".tmp.{os.getpid()}"
@@ -936,6 +986,9 @@ def format_summary_text(summary: Mapping[str, Any]) -> str:
         f"门禁：min_valid_pct = {summary.get('min_valid_pct')}%  "
         f"无效值：{summary.get('invalid_nodata')}"
     )
+    lines.append("差值口径：后一时相 − 前一时相（后减前）")
+    if summary.get("index") == "nbr":
+        lines.append("注意：NBR 相邻差值不是传统 dNBR（火前 − 火后），符号相反，不套用 dNBR 分级阈值")
     grid = summary.get("reference_grid", {})
     lines.append(
         f"参考网格：{os.path.basename(str(grid.get('path', '')))} "
@@ -985,6 +1038,8 @@ __all__ = [
     "SCL_INVALID_CLASSES",
     "INDEX_NODATA",
     "DENOM_EPS",
+    "CHANGE_DIRECTION",
+    "CHANGE_DIRECTION_NOTE",
     "SceneIndex",
     "ChangeResult",
     "supported_indices",

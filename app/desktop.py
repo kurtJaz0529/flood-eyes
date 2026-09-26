@@ -46,7 +46,7 @@ APP_NAME = "慧眼识灾 · 遥感 AI 洪水识别系统"
 try:  # 版本号单一来源：src/__init__.py，避免界面显示与安装包名不一致
     from src import __version__ as APP_VERSION  # noqa: E402
 except Exception:  # pragma: no cover
-    APP_VERSION = "0.4.0"
+    APP_VERSION = "0.5.0"
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +129,60 @@ def setup_logging() -> str:
     sys.stdout = _Tee(fh)  # type: ignore[assignment]
     sys.stderr = sys.stdout  # type: ignore[assignment]
     return path
+
+
+def bypass_proxy_for_localhost() -> None:
+    """让本机回环地址绕过代理。
+
+    Gradio 启动时会用 httpx（默认 trust_env=True）请求自己的
+    ``http://127.0.0.1:<port>/startup-events``。如果机器上存在 HTTP_PROXY /
+    HTTPS_PROXY（企业代理、容器、IDE 沙箱注入的残留变量），这个本机请求会被
+    送到代理去转发，代理拒绝或超时后 launch() 直接抛 ConnectTimeout ——
+    用户看到的现象是"双击了没反应"，日志里只有一行权重提示。
+
+    只把回环地址加入 NO_PROXY，不改动用户代理；在线地图与卫星下载仍按用户
+    原有代理设置出网。
+    """
+    hosts = ("127.0.0.1", "localhost", "::1")
+    for var in ("NO_PROXY", "no_proxy"):
+        parts = [p.strip() for p in os.environ.get(var, "").split(",") if p.strip()]
+        for host in hosts:
+            if host not in parts:
+                parts.append(host)
+        os.environ[var] = ",".join(parts)
+
+
+def start_startup_watchdog(deadline_sec: float = 60.0) -> threading.Event:
+    """启动看门狗：超时仍未完成启动就在日志里写明最可能的原因。
+
+    冻结版在少数机器上会静默卡死：Windows 没有 `_socket.socketpair`，
+    asyncio 新建事件循环时会走 socket.py 的 `_fallback_socketpair`，其中需要
+    一次 127.0.0.1 回环连接。若本机安全软件/防火墙禁止本程序发起回环连接，
+    `accept()` 会永久阻塞 —— 现象是"双击没反应，日志只停在一行权重提示"。
+    这里把这种静默失败变成可诊断的日志行，便于用户和排查者定位。
+
+    返回一个 Event，启动成功后 set()；看门狗到点发现已 set 就什么都不做。
+    """
+    done = threading.Event()
+
+    def _warn() -> None:
+        if done.is_set():
+            return
+        print(
+            f"[启动诊断] {deadline_sec:.0f} 秒内没有完成启动，进程可能已卡住。按可能性排序：\n"
+            "  1. 本机安全软件/防火墙阻止本程序发起回环(127.0.0.1)连接 —— Gradio 建立\n"
+            "     asyncio 自管道时会永久阻塞。请把本程序加入白名单。\n"
+            "  2. HTTP_PROXY/HTTPS_PROXY 指向了不可用的代理（本程序已让回环地址绕过代理，\n"
+            "     但代理本身异常仍可能拖慢其它请求）。\n"
+            "  3. 端口被占用且自动换端口失败，或权重/影像目录不可读。\n"
+            "  排查建议：在源码目录执行 python app/desktop.py --headless --port 7860 看真实报错。",
+            flush=True,
+        )
+
+    timer = threading.Timer(deadline_sec, _warn)
+    timer.daemon = True
+    timer.start()
+    return done
 
 
 def find_browser_app() -> Optional[str]:
@@ -227,13 +281,28 @@ def main() -> int:
     ap.add_argument("--baseline-only", action="store_true")
     ap.add_argument("--control", action="store_true", help="强制显示控制窗口")
     ap.add_argument("--version", action="store_true")
+    ap.add_argument("--evaluate", nargs=2, metavar=("PREDICTION", "REFERENCE"), help="离线评估两幅同网格0/1/255分类栅格")
+    ap.add_argument("--evaluation-out", help="评估JSON新文件路径（不覆盖旧文件）")
+    ap.add_argument("--terrain-profile", default="unspecified", help="精度评估的地貌标签")
     args = ap.parse_args()
+
+    if args.evaluate:
+        import json
+        from src.evaluation import evaluate_water
+        if not args.evaluation_out:
+            ap.error("--evaluate 需要 --evaluation-out 指定结果文件")
+        result = evaluate_water(*args.evaluate, terrain_profile=args.terrain_profile)
+        with open(args.evaluation_out, "x", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False, indent=2, allow_nan=False)
+        return 0
 
     if args.version:
         print(f"{APP_NAME} v{APP_VERSION}")
         return 0
 
     log_path = setup_logging()
+    bypass_proxy_for_localhost()
+    started = start_startup_watchdog()
 
     from app.main import build_ui, _launch_kwargs
     from src.infer import available_weights
@@ -274,6 +343,7 @@ def main() -> int:
 
     if last_exc is not None:
         raise last_exc
+    started.set()
     print("=" * 70)
     print(f"{APP_NAME}  v{APP_VERSION}")
     print(f"资源目录：{bundle_root()}")

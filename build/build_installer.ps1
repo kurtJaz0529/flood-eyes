@@ -59,7 +59,7 @@ if (-not $iscc) {
     $dir = Join-Path $env:USERPROFILE "InnoSetup6"
     Write-Host "      签名有效，静默安装到 $dir"
     try {
-        Start-Process -FilePath $dl -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/DIR=$dir" -Wait
+        Start-Process -FilePath $dl -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/DIR=$dir" -WindowStyle Hidden -Wait
     } finally {
         Remove-Item $dl -Force -ErrorAction SilentlyContinue
     }

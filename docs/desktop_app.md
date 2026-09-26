@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile lite -Cons
 产物：
 
 ```
-dist/慧眼识灾_v0.2.0_lite.zip      ← 直接发给评委
+dist/慧眼识灾_v0.5.0_lite.zip      ← 直接发给评委
 dist/慧眼识灾/慧眼识灾.exe          ← 本地运行
 ```
 
@@ -124,8 +124,8 @@ powershell -ExecutionPolicy Bypass -File build/build_installer.ps1
 
 | 安装包 | 体积 | 内容 |
 |---|---|---|
-| `慧眼识灾_安装程序_v0.2.0_精简版.exe` | **174.6 MB** | 基线模型，启动快 |
-| `慧眼识灾_安装程序_v0.2.0_完整版.exe` | **351.9 MB** | 额外含 PyTorch + U-Net |
+| `慧眼识灾_安装程序_v0.5.0_精简版.exe` | **143.9 MB** | 场景适配洪水识别 + 六种光谱监测，启动快 |
+| `慧眼识灾_安装程序_v0.5.0_完整版.exe` | 待重建 | 额外含 PyTorch + U-Net |
 
 **别人拿到后怎么用**：双击 setup.exe → 下一步 → 完成 → 开始菜单/桌面出现「慧眼识灾」→ 双击即用。
 **无需管理员权限、无需装 Python、无需联网。**
@@ -135,9 +135,9 @@ powershell -ExecutionPolicy Bypass -File build/build_installer.ps1
 - 装到 `%LOCALAPPDATA%\Programs\慧眼识灾`（用户级安装，不弹 UAC）
 - 开始菜单：`慧眼识灾` / `使用说明` / `识别结果目录`
 - 桌面快捷方式（可勾选）
-- 注册「添加或删除程序」卸载项（名称 `慧眼识灾 V0.2.0（精简版）`）
+- 注册「添加或删除程序」卸载项（名称 `慧眼识灾 V0.5.0（精简版）`）
 - 安装完成后可选立即启动
-- 卸载时自动清理 `outputs` / `logs` / `_internal`
+- 卸载只删除安装清单内的程序文件；运行产生的 `outputs` / `logs` 与用户权重保留
 
 ### 实测记录（两种安装包都跑过完整流程）
 

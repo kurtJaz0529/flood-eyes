@@ -641,6 +641,8 @@ def _pipeline_body(
     post_start: Optional[str], post_end: Optional[str],
     win_size: int, prog,
     terrain_profile: str = "unspecified", dem_path: Optional[str] = None,
+    detection_strategy: str = "baseline", local_pre=None, local_post=None,
+    band_order: str = "auto", water_index: str = "auto",
 ) -> Tuple[Any, Any, str, str, str]:
     """Use the same validated processing core as persistent batch jobs."""
     from types import SimpleNamespace
@@ -651,10 +653,14 @@ def _pipeline_body(
         lon=lon, lat=lat, pre_start=pre_start, pre_end=pre_end,
         post_start=post_start, post_end=post_end, size=int(win_size or 768),
         terrain_profile=terrain_profile or "unspecified",
+        detection_strategy=detection_strategy, band_order=band_order, water_index=water_index,
     )
+    if bool(local_pre) != bool(local_post):
+        raise ValueError("本地影像必须同时提供灾前和灾后两景")
     outcome = run_pipeline(
         request, os.path.join(OUT_DIR, "automation"), dem_path=dem_path,
         progress=lambda message, stage=None: prog(message),
+        local_pair=(local_pre, local_post) if local_pre and local_post else None,
     )
     result = SimpleNamespace(
         stats=outcome["stats"], meta=outcome["meta"], change=outcome.get("change"),
@@ -675,6 +681,8 @@ def run_full_pipeline(
     win_size: int,
     terrain_profile: str = "unspecified",
     dem_path: Optional[str] = None,
+    detection_strategy: str = "baseline", local_pre=None, local_post=None,
+    band_order: str = "auto", water_index: str = "auto",
 ):
     """地图选点 → 下载 → 灾前/灾后对比。后台线程跑，日志持续刷新。"""
     import threading
@@ -707,6 +715,7 @@ def run_full_pipeline(
             box["final"] = _pipeline_body(
                 lon, lat, pre_start, pre_end, post_start, post_end, win_size, prog,
                 terrain_profile, dem_path,
+                detection_strategy, local_pre, local_post, band_order, water_index,
             )
         except Exception as exc:
             box["err"] = exc
@@ -1015,12 +1024,24 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
                 terrain_profile = gr.Dropdown(
                     choices=[("未指定", "unspecified"), ("平原河湖", "plain"),
                              ("丘陵", "hilly"), ("山地", "mountain"),
-                             ("城市建成区", "urban"), ("沿海与河口", "coastal")],
+                             ("城市建成区", "urban"), ("沿海与河口", "coastal"),
+                             ("湿地与稻田", "wetland"), ("干旱区与裸地", "arid")],
                     value="unspecified", label="地貌场景（由使用者选择）",
                 )
                 dem_input = gr.File(label="可选 DEM 高程影像（高程单位：米）",
                                     file_types=[".tif", ".tiff"], type="filepath")
-                gr.Markdown("地貌用于提示适用性；提供 DEM 后另附坡度风险图，供复核使用。")
+                strategy_input = gr.Dropdown(
+                    choices=[("场景适配（实验配方，需区域验证）", "adaptive"), ("原有 NDWI 基线", "baseline")],
+                    value="adaptive", label="识别策略")
+                gr.Markdown("场景适配按地貌选择指数和复核规则；山地建议提供 DEM。复核像元单独导出，不作为无水区域。")
+                with gr.Accordion("本地多光谱影像（可选）", open=False):
+                    local_pre_input = gr.File(label="灾前 GeoTIFF", file_types=[".tif", ".tiff"], type="filepath")
+                    local_post_input = gr.File(label="灾后 GeoTIFF", file_types=[".tif", ".tiff"], type="filepath")
+                    band_order_input = gr.Dropdown(
+                        choices=["auto", "s2_bgr_nir", "s2_6band", "s2_10band", "s2_l2a_12", "s2_l2a_13"],
+                        value="auto", label="波段排列（六波段：B2/B3/B4/B8/B11/B12）")
+                    water_index_input = gr.Dropdown(choices=["auto", "ndwi", "mndwi"], value="auto", label="水体指数（自定义需场景适配）")
+                    gr.Markdown("两景均提供时使用本地影像；否则在线获取四波段。MNDWI 需要真实 SWIR，六波段重采样不会提高 SWIR 原始分辨率。")
 
         # —— 第二区（横向）：灾前↔灾后 ＋ 变化检测 ——
         with gr.Row():
@@ -1101,11 +1122,14 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
         go_btn.click(
             run_full_pipeline,
             inputs=[lon_in, lat_in, pre_start, pre_end, post_start, post_end, win_size,
-                    terrain_profile, dem_input],
+                    terrain_profile, dem_input, strategy_input, local_pre_input, local_post_input,
+                    band_order_input, water_index_input],
             outputs=[slider, change_img, pipe_stats, pipe_summary, pipe_zip, pipe_log],
         )
         from app.automation import build_automation_ui
         build_automation_ui(os.path.join(OUT_DIR, "automation"))
+        from app.spectral import build_spectral_ui
+        build_spectral_ui(os.path.join(OUT_DIR, "spectral_monitor"))
         gr.HTML(FOOTER)
     return demo
 

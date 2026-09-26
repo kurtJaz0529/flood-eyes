@@ -44,7 +44,7 @@ __all__ = [
 #: 允许的输入列：请求字段 + 可选的本地影像 / DEM 路径。
 ALLOWED_COLUMNS = tuple(PipelineRequest.__dataclass_fields__) + ("local_pre", "local_post", "dem_path")
 REQUIRED_COLUMNS = ("lon", "lat", "pre_start", "pre_end", "post_start", "post_end")
-_NUMERIC = ("lon", "lat", "max_cloud_pct", "min_valid_pct")
+_NUMERIC = ("lon", "lat", "max_cloud_pct", "min_valid_pct", "index_threshold", "slope_threshold_deg")
 
 DEFAULT_CSV = (
     "lon,lat,pre_start,pre_end,post_start,post_end,size,terrain_profile,"
@@ -403,8 +403,8 @@ def recover_interrupted_jobs(out_root: str, stale_after_s: float = 900.0) -> Dic
 # --------------------------------------------------------------------------
 
 _TERRAIN_HELP = """
-**地形背景（可选，用户声明）**：只用来提示复核重点，系统不会据此修改水体阈值或掩膜。
-`unspecified` 未声明｜`plain` 平原/河湖周边｜`hilly` 丘陵｜`mountain` 山地｜`urban` 城市｜`coastal` 沿海感潮河段。
+**地形背景（可选，用户声明）**：原基线仅提示复核；`detection_strategy=adaptive` 启用实验场景适配。
+`unspecified` 未声明｜`plain` 平原河湖｜`hilly` 丘陵｜`mountain` 山地｜`urban` 城市｜`coastal` 海岸｜`wetland` 湿地稻田｜`arid` 干旱裸地。
 
 **本地 DEM（可选）**：提供米制投影的 GeoTIFF 后，系统会把坡度 ≥15° 的区域标为“需复核”，
 并随成果包输出地形风险栅格；坡度只是筛查标记，不是淹没判据。不提供 DEM 时不做坡度筛查。
@@ -434,7 +434,8 @@ def build_automation_ui(out_root: str) -> Any:
         gr.Markdown(
             "输入列：`lon, lat, pre_start, pre_end, post_start, post_end`"
             "（必需），可选 `size, terrain_profile, max_cloud_pct, min_valid_pct, "
-            "local_pre, local_post, dem_path`。日期用 `YYYY-MM-DD`；"
+            "local_pre, local_post, dem_path, detection_strategy, water_index, "
+            "index_threshold, slope_threshold_deg, band_order`。日期用 `YYYY-MM-DD`；"
             "填了本地影像就不会联网下载，且成果会标注“本地输入，未核验观测日期”。"
         )
         with gr.Row():

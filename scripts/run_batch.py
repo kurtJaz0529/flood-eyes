@@ -14,6 +14,7 @@
 
 输入列与界面一致：必需 `lon,lat,pre_start,pre_end,post_start,post_end`，可选
 `size,terrain_profile,max_cloud_pct,min_valid_pct,local_pre,local_post,dem_path`。
+场景适配另支持 `detection_strategy,water_index,index_threshold,slope_threshold_deg,band_order`。
 只有加 `--run` 才会真正执行；只给输入文件时仅导入为等待任务。
 """
 

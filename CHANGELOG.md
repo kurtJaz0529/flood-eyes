@@ -19,9 +19,23 @@
 - **修复启动器在设置了 `HTTP_PROXY`/`HTTPS_PROXY` 的机器上无法启动**：Gradio 启动时会请求自己的 `http://127.0.0.1:<port>/startup-events`，该请求被代理转发后抛 `httpx.ConnectTimeout`，进程直接退出。现在启动器强制让回环地址绕过代理（`app/desktop.py: bypass_proxy_for_localhost`），不影响在线地图与卫星下载继续走用户代理。
 - 启动器新增 60 秒启动看门狗（`app/desktop.py: start_startup_watchdog`）：超时仍未完成启动时向 `logs/desktop.log` 写入可操作的排查建议，把"双击没反应"式静默失败变成可诊断记录。
 - 版本号统一为 0.5.0：`src/__init__.py`、`app/desktop.py`、`build/version_info.txt`、`build/installer.iss`（含脚本内注释与产物文件名）。
-- 本轮全套测试 262 通过、7 跳过（权重与真实影像缺失）；地图坐标回归和 CLI 入口检查通过。
-- 重新构建 Windows 精简版产物：`dist/慧眼识灾_v0.5.0_lite.zip`（185.5 MB，解压 408 MB）与 `dist_installer/慧眼识灾_安装程序_v0.5.0_精简版.exe`（143.9 MB）。完整版（含 PyTorch + U-Net）本轮未重建。
-- 冻结版端到端启动验收**未完成**：本机安全策略阻止未知可执行程序发起回环连接，Gradio 建立 asyncio 自管道时阻塞在 `socket.socketpair` 的 `accept()`。源码方式启动正常，问题定位与复现证据见 [交接说明](docs/交接说明_20260926.md)。
+- 本轮全套测试 305 通过、7 跳过（权重与真实影像缺失）；地图坐标回归通过。源码界面通过 51 项端到端检查，冻结离线计算通过 46 项检查；检查均使用合成数据。
+- 新增 EXE `--batch`、`--spectral`、`--diagnose`、`--data-dir`；批处理遇到失败/取消任务返回非零退出码。
+- 启动前检查本机连接，失败提示并退出；合并大小写 NO_PROXY 条目并保留现有代理。启动超时记录线程调用栈，不再将具体安全软件作为未经验证的根因。
+- ZIP 原子生成，ZIP 和安装器均排除运行成果/日志；验收改用独立数据目录、明确 API 超时和新任务状态检查。
+- 修复选景吞掉超时异常、重试前未检查预算，以及 0% 云量被当作缺失值的问题。
+- 重新构建 Windows 精简版安装包和绿色 ZIP，精确体积与 SHA256 见发布清单。完整版（含 PyTorch + U-Net）本轮未构建。
+- 回环诊断改为报告 `loopback_timeout`，不凭超时认定具体防火墙。随包修复脚本及 netsh 命令限定 TCP、指定程序与两端 127.0.0.1；修复源码布局路径及卸载后撤销规则，新增无副作用 `-DryRun`。接续回归 310 项通过、7 项跳过；冻结界面仍受本机回环限制。详见 [接续验收](docs/接续验收_20260926.md)。
+- 启动器把该失败翻译成可执行结论：`--diagnose` 报告新增 `stage`/`cause`/`detail`/`remedy`，区分"入站被丢弃（超时）"与"端口无人监听（拒绝）"；后者不再误导用户去改防火墙。启动失败提示直接给出 `netsh advfirewall firewall add rule` 命令，并随包分发 `_internal/scripts/allow_loopback.ps1`（提权、幂等、支持 `-Remove` 撤销）。新增 7 项回归测试。
+- 修复安装验收的隔离缺陷：`DisableProgramGroupPage=yes` 时 Inno Setup 会忽略运行期 `/GROUP=`，验收安装因此写进了**生产开始菜单组**。改为编译期 `/DGroupName=`，并由 `scripts/verify_installer.py` 自行编译验收专用安装包（独立 AppId + 独立组名），断言 smoke 组名不等于生产组名，新增 `production_group_untouched`、`production_group_still_untouched` 两项防复发检查。
+- 安装/卸载验收通过 **18/18**：独立卸载登记、真实安装登记未被改动、三处开始菜单快捷方式、载荷哈希、安装包不含运行数据、安装后离线计算、卸载移除程序、保留用户成果与日志、测试登记与快捷方式清理。
+- 在线影像读取失败改为给出归因：`describe_network_error` 区分证书吊销查询失败、连接超时与域名解析失败，并在选景全失败时打印根因；STAC 检索失败同样打印归因。**判定改为"先 WinError 数字码、再英文关键词"**：Windows 错误文案随系统语言本地化，中文系统抛的是 `[WinError 10060] 由于连接方在一段时间后没有正确答复…`，只匹配英文 `timed out` 会全部漏判；数字码在本地化文案中原样保留，并额外检查 `URLError.reason` 的底层异常类型。受限网络可显式设 `FLOOD_ALLOW_UNSAFE_TLS=1` 降级（默认关闭；GDAL 3.12 未暴露只关吊销检查的开关，核对过 DLL 配置项，只有全关的 `GDAL_HTTP_UNSAFESSL`），降级状态写入成果溯源 `tls_verification_disabled`；纯网络不通时**不会**建议关闭证书校验。新增 21 项回归测试。
+- 冻结图形界面启动验收**仍未在本机取得通过记录**：该阻塞属于部署环境要求（安装包以 `PrivilegesRequired=lowest` 安装，不申请管理员权限，无法在安装阶段自动写防火墙规则），需用户执行一次放行。在线目录检索通过，影像下载在本轮网络下连 S3 COG 主机超时，未禁用 TLS 校验。详见 [安装与离线运行](docs/安装与离线运行.md)。
+- **最终产物在改完本地化归因缺陷后全部重跑验收**：全套回归 305 通过 / 7 跳过；冻结离线计算 46/46；安装 / 卸载 18/18（自编译隔离安装包，生产开始菜单组前后未变）；源码界面端到端 51/51。最终产物 SHA256：安装程序 `3469760d00b4b317…`、绿色 ZIP `f304d5c65e0b386a…`、主程序 EXE `125184dcf099778f…`；ZIP 内 `_internal/scripts/fetch_real_samples.py` 与源码逐字节一致（`zip_scripts_match_source=true`）。清单见 `outputs/release_v0.5.0/release_manifest.json`，验收证据见 [收尾验收报告](docs/验收报告_20260926_续.md)。
+- 安装验收报告新增 `uninstaller_self_removed` 与 `residual_entries` 两项**只记录、不判定**的字段：Inno 卸载器结束前要改名删除自身，该步骤在受限环境会被拦下，于是 `unins000.exe` 会残留在安装目录里（同时 `logs`/`outputs`/`weights` 因承载用户数据而被有意保留）。程序载荷确已移除、用户数据确已保留，属环境限制而非产品缺陷，记录在案以免复核者误判。
+- 补上环境变量文档缺口：核对代码实际读取的 5 个 `FLOOD_*` 变量后发现 `FLOOD_DATA_DIR`（可写根目录，用户可感知）与 `FLOOD_APP_NAME` 在任何文档中都未出现，`FLOOD_ALLOW_UNSAFE_TLS` 也未写进面向安装用户的《安装与离线运行》。已在《安装与离线运行》新增"环境变量"一节，列出 `FLOOD_DATA_DIR`、`FLOOD_ALLOW_UNSAFE_TLS` 的作用、取值、默认值与示例（含"纯网络不通时不要开证书降级"的警示），并单列 `FLOOD_PROFILE`/`FLOOD_CONSOLE`/`FLOOD_APP_NAME` 三个构建期变量。
+- 清理本轮累积的约 3.0 GB 构建残留（`dist/_prev_*`、`dist_dbg*`、`probe_*`、`install-smoke-*`、`smoke_build`、`build/_prev_*` 等共 18 项）。清理按模式匹配并逐路径做三重守卫（须在仓库根之下、不得命中 denylist、不得是重解析点），事后复核三个最终产物 SHA256 与发布清单仍逐字节一致、全部验收证据文件完好。
+- **修复测试收集缺陷**：仓库缺少 pytest 配置，而文档记录的验收命令是在仓库根执行 `python -m pytest -q`，于是 pytest 会递归收集到 `outputs/` 下的调查脚本（`outputs/release_v0.5.0/net_serve_test.py` 文件名匹配 `*_test.py`）。该脚本顶层就是可执行代码，**在收集阶段即被导入执行**，会启动探针进程并等待端口文件：平时表现为静默多耗约 16 秒（47.23s → 30.83s），探针产物被清理后则直接抛 `FileNotFoundError` 使整套测试无法收集。新增 `pytest.ini` 用 `norecursedirs` 显式排除产物目录（因设置该项会覆盖 pytest 默认值，故把 `.*`/`build`/`dist`/`*.egg`/`venv` 等默认项一并写出）。修复后测试项数不变（305 通过 / 7 跳过，证明这些用例本就全部来自 `tests/` 与根目录 `test_e2e.py`）。
 
 ## [未发布历史] - 2026-09-23
 

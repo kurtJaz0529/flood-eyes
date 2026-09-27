@@ -35,6 +35,11 @@ def bundle_root() -> str:
 
 def user_root() -> str:
     """可写目录：优先 exe 同目录（便携），不可写则退到 LOCALAPPDATA。"""
+    override = os.environ.get("FLOOD_DATA_DIR")
+    if override:
+        path = os.path.abspath(os.path.expanduser(override))
+        os.makedirs(path, exist_ok=True)
+        return path
     if not is_frozen():
         return bundle_root()
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))

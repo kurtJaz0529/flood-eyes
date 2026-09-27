@@ -143,46 +143,154 @@ def bypass_proxy_for_localhost() -> None:
     只把回环地址加入 NO_PROXY，不改动用户代理；在线地图与卫星下载仍按用户
     原有代理设置出网。
     """
-    hosts = ("127.0.0.1", "localhost", "::1")
+    parts = []
     for var in ("NO_PROXY", "no_proxy"):
-        parts = [p.strip() for p in os.environ.get(var, "").split(",") if p.strip()]
-        for host in hosts:
-            if host not in parts:
-                parts.append(host)
+        for entry in os.environ.get(var, "").split(","):
+            entry = entry.strip()
+            if entry and entry not in parts:
+                parts.append(entry)
+    for host in ("127.0.0.1", "localhost", "::1"):
+        if host not in parts:
+            parts.append(host)
+    for var in ("NO_PROXY", "no_proxy"):
         os.environ[var] = ",".join(parts)
 
 
 def start_startup_watchdog(deadline_sec: float = 60.0) -> threading.Event:
-    """启动看门狗：超时仍未完成启动就在日志里写明最可能的原因。
-
-    冻结版在少数机器上会静默卡死：Windows 没有 `_socket.socketpair`，
-    asyncio 新建事件循环时会走 socket.py 的 `_fallback_socketpair`，其中需要
-    一次 127.0.0.1 回环连接。若本机安全软件/防火墙禁止本程序发起回环连接，
-    `accept()` 会永久阻塞 —— 现象是"双击没反应，日志只停在一行权重提示"。
-    这里把这种静默失败变成可诊断的日志行，便于用户和排查者定位。
-
-    返回一个 Event，启动成功后 set()；看门狗到点发现已 set 就什么都不做。
-    """
+    """超时记录各线程堆栈；单凭超时不推断安全软件或网络根因。"""
     done = threading.Event()
 
     def _warn() -> None:
         if done.is_set():
             return
         print(
-            f"[启动诊断] {deadline_sec:.0f} 秒内没有完成启动，进程可能已卡住。按可能性排序：\n"
-            "  1. 本机安全软件/防火墙阻止本程序发起回环(127.0.0.1)连接 —— Gradio 建立\n"
-            "     asyncio 自管道时会永久阻塞。请把本程序加入白名单。\n"
-            "  2. HTTP_PROXY/HTTPS_PROXY 指向了不可用的代理（本程序已让回环地址绕过代理，\n"
-            "     但代理本身异常仍可能拖慢其它请求）。\n"
-            "  3. 端口被占用且自动换端口失败，或权重/影像目录不可读。\n"
-            "  排查建议：在源码目录执行 python app/desktop.py --headless --port 7860 看真实报错。",
+            f"[启动诊断] {deadline_sec:.0f} 秒内尚未完成启动。以下为当前线程调用栈；\n"
+            "请结合具体异常排查端口、文件权限、依赖加载或本机连接情况。",
             flush=True,
         )
+        import traceback
+        for thread_id, frame in sys._current_frames().items():
+            print(f"[线程 {thread_id}]", flush=True)
+            traceback.print_stack(frame, file=sys.stderr)
 
     timer = threading.Timer(deadline_sec, _warn)
     timer.daemon = True
     timer.start()
     return done
+
+
+FIREWALL_RULE_NAME = "慧眼识灾 本机界面"
+
+
+class LoopbackError(OSError):
+    """本机回环自检失败。继承 OSError，兼容既有的 `except OSError` 调用方。"""
+
+    def __init__(self, stage: str, cause: str, detail: str, remedy: str, original: BaseException):
+        super().__init__(f"{stage}: {type(original).__name__}: {original}")
+        self.stage = stage
+        self.cause = cause
+        self.detail = detail
+        self.remedy = remedy
+        self.original = original
+
+    def as_dict(self) -> dict:
+        return {"status": "failed", "stage": self.stage, "cause": self.cause,
+                "detail": self.detail, "remedy": self.remedy,
+                "error": f"{type(self.original).__name__}: {self.original}"}
+
+
+def firewall_remedy(exe_path: str, rule_name: str = FIREWALL_RULE_NAME) -> str:
+    """放行本程序入站连接所需的命令（需要管理员权限的命令行）。
+
+    只放行本程序与 TCP：界面是本机 HTTP 服务，用不到 UDP，也无需对其他程序开口。
+    """
+    return (f'netsh advfirewall firewall add rule name="{rule_name}" dir=in action=allow '
+            f'protocol=TCP program="{exe_path}" localip=127.0.0.1 remoteip=127.0.0.1 '
+            'enable=yes profile=any')
+
+
+def classify_loopback_failure(stage: str, exc: BaseException, exe_path: str) -> LoopbackError:
+    """报告可观察到的失败，不把超时直接认定为某一种防火墙。
+
+    改名副本与原程序的差异支持按进程过滤的可能性，不能识别具体过滤组件。
+    """
+    remedy = firewall_remedy(exe_path)
+    if isinstance(exc, TimeoutError) and stage in ("connect", "accept"):
+        return LoopbackError(
+            stage, "loopback_timeout",
+            "本机回环连接超时，可能与防火墙、安全软件或其他进程网络策略有关。"
+            "仅凭超时不能确定过滤方向或具体拦截组件，需结合系统日志排查。",
+            remedy, exc)
+    if isinstance(exc, ConnectionRefusedError):
+        return LoopbackError(
+            stage, "not_listening",
+            "本机端口拒绝连接，说明该端口上没有监听者，属于程序内部状态异常，"
+            "不是网络策略问题。", "", exc)
+    if isinstance(exc, PermissionError):
+        return LoopbackError(
+            stage, "bind_denied",
+            "绑定本机端口被拒绝，通常是端口被占用或权限受限。", "", exc)
+    return LoopbackError(
+        stage, "unknown",
+        "本机回环自检出现未归类错误，请结合原始异常排查。", "", exc)
+
+
+def check_loopback(timeout: float = 4.0) -> dict:
+    """启动界面前验证回环连接，避免 asyncio 的 socketpair 无限等待。
+
+    Windows 上 ``socket.socketpair()`` 是用回环 TCP 对模拟的，且没有超时；
+    一旦入站连接被过滤，``asyncio`` 建事件循环时会永久阻塞，界面永远起不来。
+    所以必须在建循环之前先把这一步探明。
+    """
+    exe_path = sys.executable
+    listener = client = None
+    stage = "bind"
+    try:
+        listener = socket.socket()
+        client = socket.socket()
+        listener.settimeout(timeout)
+        client.settimeout(timeout)
+        listener.bind(("127.0.0.1", 0))
+        stage = "listen"
+        listener.listen(1)
+        stage = "connect"
+        client.connect(listener.getsockname())
+        stage = "accept"
+        peer, _ = listener.accept()
+        try:
+            peer.settimeout(timeout)
+            peer.sendall(b"ok")
+            stage = "recv"
+            if client.recv(2) != b"ok":
+                raise ConnectionError("本机连接校验数据不完整")
+        finally:
+            peer.close()
+    except OSError as exc:
+        raise classify_loopback_failure(stage, exc, exe_path) from exc
+    finally:
+        for sock in (client, listener):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return {"status": "ok", "address": "127.0.0.1"}
+
+
+def loopback_failure_message(exc: BaseException, log_path: Optional[str]) -> str:
+    """把回环自检失败整理成给用户看的说明（含可执行的解决办法）。"""
+    lines = [f"无法建立本机连接（127.0.0.1）：{type(exc).__name__}: {exc}"]
+    if isinstance(exc, LoopbackError):
+        lines += ["", f"判定：{exc.detail}"]
+        if exc.remedy:
+            lines += ["",
+                      "如确认是 Windows 防火墙拦截，可选择以下一种方式尝试（仅放行回环）：",
+                      "  1. 右键以管理员身份运行 _internal\\scripts\\allow_loopback.ps1，"
+                      "为本程序放行入站连接；",
+                      "  2. 在管理员命令行执行：",
+                      f"     {exc.remedy}"]
+    lines += ["", "界面服务未启动。", f"日志：{log_path}"]
+    return "\n".join(lines)
 
 
 def find_browser_app() -> Optional[str]:
@@ -272,7 +380,7 @@ def control_window(url: str, on_quit) -> None:
 # --------------------------------------------------------------------------
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7860)
@@ -281,10 +389,41 @@ def main() -> int:
     ap.add_argument("--baseline-only", action="store_true")
     ap.add_argument("--control", action="store_true", help="强制显示控制窗口")
     ap.add_argument("--version", action="store_true")
+    ap.add_argument("--data-dir", help="结果、日志与任务库的可写根目录")
+    ap.add_argument("--diagnose", metavar="JSON", help="检查本机连接并写入新的诊断JSON，不启动界面")
+    commands = ap.add_mutually_exclusive_group()
+    commands.add_argument("--batch", nargs=argparse.REMAINDER, help="批处理命令，后续参数与 scripts/run_batch.py 相同")
+    commands.add_argument("--spectral", nargs=argparse.REMAINDER, help="光谱监测命令，后续参数与 scripts/run_spectral.py 相同")
     ap.add_argument("--evaluate", nargs=2, metavar=("PREDICTION", "REFERENCE"), help="离线评估两幅同网格0/1/255分类栅格")
     ap.add_argument("--evaluation-out", help="评估JSON新文件路径（不覆盖旧文件）")
     ap.add_argument("--terrain-profile", default="unspecified", help="精度评估的地貌标签")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.data_dir:
+        os.environ["FLOOD_DATA_DIR"] = os.path.abspath(args.data_dir)
+
+    if args.batch is not None or args.spectral is not None:
+        setup_logging()
+        bypass_proxy_for_localhost()
+        if args.batch is not None:
+            from scripts.run_batch import main as batch_main
+            return batch_main(args.batch)
+        from scripts.run_spectral import main as spectral_main
+        return spectral_main(args.spectral)
+
+    if args.diagnose:
+        import json
+        result = {"version": APP_VERSION, "frozen": bool(getattr(sys, "frozen", False)),
+                  "bundle_root": bundle_root(), "data_root": user_root(),
+                  "executable": sys.executable}
+        try:
+            result["loopback"] = check_loopback()
+        except LoopbackError as exc:
+            result["loopback"] = exc.as_dict()
+        except OSError as exc:
+            result["loopback"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+        with open(args.diagnose, "x", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False, indent=2)
+        return 0 if result["loopback"]["status"] == "ok" else 1
 
     if args.evaluate:
         import json
@@ -302,6 +441,23 @@ def main() -> int:
 
     log_path = setup_logging()
     bypass_proxy_for_localhost()
+    try:
+        check_loopback()
+    except OSError as exc:
+        message = loopback_failure_message(exc, log_path)
+        print(message, flush=True)
+        if not args.headless and not args.no_window:
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showerror(APP_NAME, message, parent=root)
+                root.destroy()
+            except Exception:
+                pass
+        return 1
+    os.environ.setdefault("GRADIO_TEMP_DIR", os.path.join(user_root(), "outputs", ".gradio"))
     started = start_startup_watchdog()
 
     from app.main import build_ui, _launch_kwargs

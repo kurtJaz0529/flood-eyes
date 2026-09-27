@@ -738,7 +738,7 @@ def run_full_pipeline(
             last_beat = now
             yield snapshot()
         elif now - last_beat >= 8:
-            prog("仍在下载/处理，请稍候（网络慢时单景窗口可能要 1–3 分钟）…")
+            prog("仍在下载/处理，请稍候（网络慢时整对影像下载最多等待 5 分钟）…")
             last_beat = now
             yield snapshot()
 
@@ -957,12 +957,11 @@ def load_event_template(event_id: Optional[str]):
 
 
 def build_ui(baseline_only: bool = False) -> gr.Blocks:
-    _ = baseline_only
     with gr.Blocks(**_blocks_kwargs("慧眼识灾 · 遥感 AI 洪水识别系统")) as demo:
         gr.HTML(_header_html())
         gr.Markdown(
             "在地图上点选任意地点后点击‘使用此地点’（或搜索地名），填好灾前/灾后时间范围后一键分析。"
-            "系统按所选地点下载 Sentinel-2 公开影像并对比，首次下载约 1–3 分钟，同一地点再次分析走本地缓存。"
+            "系统按所选地点下载 Sentinel-2 公开影像并对比，首次下载约 1–5 分钟，同一地点再次分析走本地缓存。"
         )
 
         # —— 第一区（横向）：地图选点 ＋ 参数设置 ——
@@ -1126,6 +1125,32 @@ def build_ui(baseline_only: bool = False) -> gr.Blocks:
                     band_order_input, water_index_input],
             outputs=[slider, change_img, pipe_stats, pipe_summary, pipe_zip, pipe_log],
         )
+        if not baseline_only and available_weights():
+            with gr.Accordion("U-Net 实验模型 · 本地影像识别", open=False):
+                gr.Markdown("实验模型尚未完成目标区域精度验收。L1C 训练与 L2A 输入存在差异，请与 NDWI 结果及原始影像交叉复核。此处上传带 B2/B3/B4/B8 波段信息的 GeoTIFF。")
+                with gr.Row():
+                    deep_pre = gr.File(label="灾前影像（双时相对比时提供）", file_types=[".tif", ".tiff"], type="filepath")
+                    deep_post = gr.File(label="待识别 / 灾后影像", file_types=[".tif", ".tiff"], type="filepath")
+                with gr.Row():
+                    deep_mode = gr.Dropdown(["NDWI + Otsu 基线", "U-Net 深度模型"], value="NDWI + Otsu 基线", label="模型")
+                    deep_weights = gr.Dropdown([(os.path.basename(p), p) for p in available_weights()], value=available_weights()[0], label="实验权重")
+                    deep_threshold = gr.Slider(0.05, 0.95, value=0.5, step=0.05, label="U-Net 概率阈值")
+                deep_info = gr.Markdown()
+                deep_mode.change(show_model_info, [deep_mode, deep_weights], deep_info)
+                deep_weights.change(show_model_info, [deep_mode, deep_weights], deep_info)
+                with gr.Row():
+                    deep_single = gr.Button("单景水体识别")
+                    deep_compare = gr.Button("灾前 / 灾后对比")
+                deep_slider = image_slider_component("模型识别对比")
+                deep_overlay = gr.Image(label="识别 / 变化结果")
+                deep_stats = gr.HTML()
+                deep_summary = gr.Textbox(label="结果与质量提示", lines=5)
+                deep_zip = gr.File(label="模型成果包", interactive=False)
+                deep_log = gr.Textbox(label="模型运行记录", lines=5)
+                deep_outputs = [deep_slider, deep_overlay, deep_stats, deep_summary, deep_zip, deep_log]
+                no_input, pixel_auto, minimum, no_tta = gr.State(None), gr.State(0), gr.State(120), gr.State(False)
+                deep_single.click(run_single, [deep_post, no_input, no_input, deep_mode, pixel_auto, minimum, deep_threshold, no_tta, deep_weights], deep_outputs)
+                deep_compare.click(run_compare, [deep_pre, deep_post, no_input, deep_mode, pixel_auto, minimum, deep_threshold, deep_weights], deep_outputs)
         from app.automation import build_automation_ui
         build_automation_ui(os.path.join(OUT_DIR, "automation"))
         from app.spectral import build_spectral_ui

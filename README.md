@@ -43,7 +43,7 @@
    │
 [识别]   三种策略
    ├─ 光学基线：NDWI + Otsu 自适应阈值 + 近红外物理闸门   ← 零训练、零 GPU
-   ├─ 光学深度：U-Net 语义分割（smp + ImageNet 预训练骨干） ← 精度上限
+   ├─ 光学深度：U-Net 语义分割（smp + ImageNet 预训练骨干） （精度取决于训练数据与独立评测）
    └─ 雷达：低后向散射 + 相对变暗双条件提取水体            ← 汛期穿云，2021 河南实测可用
    │
 [后处理] 形态学去噪 → 连通域过滤 → 空洞填充 → 轮廓叠加 → 面积统计(km²)
@@ -126,7 +126,7 @@ print(result.summary_text())
 python train.py --data data/samples --epochs 20 --img-size 256 --arch tiny
 
 # 真实数据（推荐）
-python scripts/download_data.py --dataset sen1floods11          # 看下载指引
+python scripts/prepare_sen1floods.py --out data/sen1floods11/pilot # 下载真实标注试验集
 python train.py --data data/sen1floods11 --epochs 60 --img-size 512 `
     --arch smp --encoder resnet34 --encoder-weights imagenet --batch-size 8
 ```
@@ -140,17 +140,22 @@ python train.py --data data/sen1floods11 --epochs 60 --img-size 512 `
 | 安装包 | 体积 | 内容 |
 |---|---|---|
 | `慧眼识灾_安装程序_v0.5.0_精简版.exe` | **143.9 MB** | 场景适配洪水识别 + 六种光谱监测，无需 GPU |
-| `慧眼识灾_安装程序_v0.5.0_完整版.exe` | 待重建 | 额外含 PyTorch + U-Net |
+| `慧眼识灾_安装程序_v0.5.0_完整版.exe` | **247.6 MB** | PyTorch CPU + 真实标注训练的实验 TinyUNet |
 
-别人拿到后：**双击 setup.exe → 下一步 → 完成 → 开始菜单/桌面点「慧眼识灾」直接用**。
-无需管理员权限、无需装 Python、无需联网；卸载走「添加或删除程序」。
+使用流程：双击 setup.exe → 安装 → 开始菜单/桌面启动「慧眼识灾」。
+无需管理员权限、无需装 Python；本地处理可离线，在线地图与下载需要网络。卸载走「添加或删除程序」。
 
-安装包会创建：开始菜单（`慧眼识灾` / `使用说明` / `识别结果目录`）、桌面快捷方式、卸载项，
+**2026-09-27 修复进展：** 本机为指定 EXE 添加仅限 127.0.0.1 的 TCP 回环规则后，冻结图形界面 51 项检查全部通过。安装目录改变时需要重新对该程序应用规则；开始菜单提供“修复本机连接”入口。
+
+在线 Sentinel 下载已通过 Python HTTPS Range 读取完成真实灾前/灾后影像下载，保持证书验证。Windows 默认使用这一传输方式，避开本机 GDAL/Schannel 吊销检查故障。详见 [修复记录](docs/问题修复与完整版交付_20260927.md)。
+
+
+安装包会创建：开始菜单（`慧眼识灾` / `使用说明` / `识别结果目录` / `修复本机连接`）、桌面快捷方式、卸载项，
 安装目录可写，识别结果与 PDF 简报就存在 `<安装目录>\outputs\`。
 
 ```powershell
 # 一条命令生成安装包（会自动下载 Inno Setup 编译器）
-powershell -ExecutionPolicy Bypass -File build/build_installer.ps1
+powershell -ExecutionPolicy Bypass -File build/build_installer.ps1 -Edition lite
 ```
 
 ### 方式二：绿色版 zip（解压即用）
@@ -164,6 +169,8 @@ powershell -ExecutionPolicy Bypass -File build/build_installer.ps1
 powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile lite   # 产物 dist/
 powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile full   # 产物 dist_full/
 python scripts/verify_packaged_app.py --exe "dist/慧眼识灾/慧眼识灾.exe"    # 自动验收
+python scripts/verify_release.py --source --report outputs/source_ui.json  # 源码界面对照
+python scripts/verify_frozen_cli.py --exe "dist/慧眼识灾/慧眼识灾.exe" --report outputs/frozen_cli.json
 ```
 
 > 打包踩过的坑（GDAL/PROJ 数据、delvewheel DLL、uvicorn 日志、polars 176 MB 体积、中文 PDF 字体）
@@ -404,7 +411,7 @@ python tests/test_pipeline.py
 |---|---|---|
 | M0 | 环境 + 依赖 + 自检 | ✅ |
 | M1 | 基线 + 后处理 + Gradio v0.1 | ✅ |
-| M2 | U-Net 训练链路 + 指标曲线 | ✅（合成数据）；⬜ Sen1Floods11 真实训练 |
+| M2 | U-Net 训练链路 + 指标曲线 | ✅ 合成流程与 Sen1Floods11 小规模真实训练；区域精度待验收 |
 | M3 | 双时相 + 面积报表 + PDF 导出 + 美化 | ✅ |
 | M4 | 仓库 + README + GIF + 路演材料 | ✅；⬜ 3 分钟录屏 |
 | 真实数据 | 抓取真实 Sentinel-2 灾前/灾后影像（2 组，含溯源） | ✅ |
@@ -436,3 +443,11 @@ python tests/test_pipeline.py
 <div align="center">
 <sub>慧眼识灾 · 演示版 v0.1 ｜ 让每一景免费卫星影像，都能在救援决策中被用上</sub>
 </div>
+
+### 2026-09-27 最终交付
+
+两版均已重新生成安装程序和便携 ZIP；完整版 58/58、精简版 53/53 界面及真实在线检查通过，两版离线命令各 46/46、安装卸载各 18/18。代码测试 366 passed / 5 skipped。两版都已在本机完成 512×512 真实 Sentinel 灾前/灾后下载和 PDF/GIS 成果导出，保持 TLS 验证。
+
+完整版的“U-Net 实验模型 · 本地影像识别”支持单景与双时相。权重已内置，无需再找模型；默认仍为 NDWI。真实小型留出测试 IoU 0.837、F1 0.911，尚不代表目标区域精度。
+
+详情见 [修复与交付记录](docs/问题修复与完整版交付_20260927.md)，文件大小、SHA256 和最终报告见 [交付清单](outputs/resolution_20260927/delivery_manifest.json)。

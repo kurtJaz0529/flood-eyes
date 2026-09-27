@@ -56,6 +56,7 @@ from src.spectral_monitor import (  # noqa: E402
     run_monitor,
     supported_indices,
 )
+from src.paths import outputs_dir  # noqa: E402
 
 _EXAMPLE = (
     "示例：\n"
@@ -146,7 +147,7 @@ def main(argv=None) -> int:
     images = [os.path.abspath(os.fspath(p)) for p in args.images]
     dates = _parse_dates(args.dates)
     out_dir = args.out_dir or os.path.join(
-        ROOT, "outputs", "spectral_monitor",
+        outputs_dir(), "spectral_monitor",
         datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8],
     )
 

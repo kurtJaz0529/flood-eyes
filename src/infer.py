@@ -237,7 +237,8 @@ class FloodDetector:
             # 因此宁可读不出元数据，也不回退到不安全加载。
             payload = torch.load(path, map_location="cpu", weights_only=True)
             note = str((payload.get("meta") or {}).get("data_note") or "")
-            looks_synthetic = "synthetic" in note.lower()
+            looks_synthetic = ("synthetic" in note.lower()
+                               or (payload.get("meta") or {}).get("auto_eligible") is False)
         except Exception:
             # 旧格式/损坏/非 torch.save 文件：按"非合成"处理，与既有行为一致。
             looks_synthetic = False
@@ -309,7 +310,7 @@ class FloodDetector:
             info = {"mode": "baseline", "label": "NDWI + Otsu 基线", "device": self.device}
             path = self._weights_path()
             if self.mode == "auto" and path and self._weights_looks_synthetic(path):
-                info["warning"] = "当前权重为合成样本训练，自动模式已改用 NDWI 基线；如需 U-Net 请显式选择"
+                info["warning"] = "当前权重为合成样本或未完成区域验证的实验权重，自动模式使用 NDWI 基线；如需 U-Net 请显式选择"
             elif self._load_error:
                 info["label"] = "NDWI + Otsu 基线(降级)"
                 info["warning"] = self._load_error
@@ -546,6 +547,9 @@ class FloodDetector:
                 "该权重是在合成样本上训练的，仅用于验证流程；真实影像上的分割结果可能过检/漏检，"
                 "请以 NDWI 基线结果交叉验证，或用 Sen1Floods11 重新训练"
             )
+        if self._model_meta.get("auto_eligible") is False:
+            warnings.append("当前 U-Net 为实验权重，尚未完成目标区域精度验收；L1C TOA 训练数据与 L2A 地表反射率存在差异，请人工复核结果")
+            pmeta["data_note"] = self._model_meta.get("data_note", "")
         return prob, pmeta
 
     # -- 双时相对比 --------------------------------------------------------

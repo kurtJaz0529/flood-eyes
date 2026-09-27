@@ -282,7 +282,7 @@ def _acquire(request: PipelineRequest, out_root: str) -> Tuple[str, str, Dict[st
     module = _fetch_module()
     entry = module.fetch_event(
         key, cfg, cache_dir, size=int(request.size),
-        max_cloud=float(request.max_cloud_pct), allow_cloudy=False, fast=False, budget_s=120,
+        max_cloud=float(request.max_cloud_pct), allow_cloudy=False, fast=False, budget_s=300,
     )
     if not isinstance(entry, dict):
         raise RuntimeError(

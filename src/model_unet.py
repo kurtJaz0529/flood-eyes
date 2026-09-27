@@ -163,10 +163,13 @@ def count_parameters(model: nn.Module) -> int:
 
 
 def dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    probs = torch.sigmoid(logits)
-    num = 2.0 * (probs * targets).sum(dim=(1, 2, 3)) + EPS
-    den = probs.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3)) + EPS
-    return 1.0 - (num / den).mean()
+    valid = torch.isfinite(targets) & (targets >= 0)
+    clean = torch.where(valid, targets, torch.zeros_like(targets))
+    probs = torch.sigmoid(logits) * valid
+    num = 2.0 * (probs * clean).sum(dim=(1, 2, 3)) + EPS
+    den = probs.sum(dim=(1, 2, 3)) + clean.sum(dim=(1, 2, 3)) + EPS
+    usable = valid.sum(dim=(1, 2, 3)) > 0
+    return ((1.0 - num / den) * usable).sum() / usable.sum().clamp(min=1)
 
 
 class DiceBCELoss(nn.Module):
@@ -179,7 +182,10 @@ class DiceBCELoss(nn.Module):
         self.register_buffer("pos_weight", torch.tensor([pos_weight], dtype=torch.float32))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=self.pos_weight)
+        valid = torch.isfinite(targets) & (targets >= 0)
+        clean = torch.where(valid, targets, torch.zeros_like(targets))
+        raw = F.binary_cross_entropy_with_logits(logits, clean, pos_weight=self.pos_weight, reduction="none")
+        bce = (raw * valid).sum() / valid.sum().clamp(min=1)
         return self.bce_weight * bce + self.dice_weight * dice_loss(logits, targets)
 
 
@@ -195,7 +201,13 @@ def segmentation_metrics(
 ) -> Dict[str, float]:
     """IoU / Dice(F1) / Precision / Recall。pred 可为 bool 或概率（>0.5 视为水）。"""
     pred = np.asarray(pred)
-    target = np.asarray(target).astype(bool)
+    target = np.asarray(target)
+    if pred.shape != target.shape:
+        raise ValueError("Prediction and target shapes differ")
+    valid = np.isfinite(target) & (target >= 0)
+    if not np.isfinite(pred[valid]).all():
+        raise ValueError("Nonfinite prediction on valid target pixels")
+    pred, target = pred[valid], target[valid] > 0.5
     if pred.dtype != bool:
         pred = pred > 0.5
     pred = pred.astype(bool)

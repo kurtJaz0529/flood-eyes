@@ -10,8 +10,9 @@
 ;   ISCC.exe /DProfile=lite build\installer.iss    -> 慧眼识灾_安装程序_v0.5.0_精简版.exe
 ;   ISCC.exe /DProfile=full build\installer.iss    -> 慧眼识灾_安装程序_v0.5.0_完整版.exe
 ;
-; 测试编译（不覆盖本机已装版本的卸载登记）：
-;   ISCC.exe /DProfile=lite /DAppIdValue={{测试专用GUID} build\installer.iss
+; 测试编译（不覆盖本机已装版本的卸载登记，也不写生产开始菜单组）：
+;   ISCC.exe /DProfile=lite /DAppIdValue={{测试专用GUID} /DGroupName="测试专用组名" build\installer.iss
+;   注意：必须用 /DGroupName 而不是运行期的 /GROUP=；见下面 GroupName 处的说明。
 ;
 ; 也可以用 build/build_installer.ps1 一键编译。
 
@@ -34,6 +35,12 @@
 #ifndef AppIdValue
   #define AppIdValue "{{8F3C2A41-6D2B-4E7A-9C15-1B7E4F0A2D33}"
 #endif
+; 开始菜单组名。验收时必须用 /DGroupName=... 指向一个独立组：
+; DisableProgramGroupPage=yes 时 Setup 会忽略 /GROUP= 命令行参数，只用这里的值，
+; 否则验收安装会写进生产开始菜单组并覆盖真实安装的快捷方式。
+#ifndef GroupName
+  #define GroupName AppName
+#endif
 #define AppPublisher "慧眼识灾团队"
 #define AppExeName "慧眼识灾.exe"
 
@@ -50,7 +57,7 @@ VersionInfoDescription={#AppName} 安装程序（{#EditionName}）
 VersionInfoTextVersion={#AppVersion}
 AppMutex=HuiYanShiZai_SingleInstance_Mutex
 DefaultDirName={autopf}\{#AppName}
-DefaultGroupName={#AppName}
+DefaultGroupName={#GroupName}
 DisableProgramGroupPage=yes
 DisableDirPage=no
 AllowNoIcons=yes
@@ -81,7 +88,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 ; 主程序（整个 _internal 目录一并装进去）
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "\outputs\*,\logs\*,__pycache__\*,*.pyc,.pytest_cache\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Dirs]
 ; 提前建好输出目录，用户装完就能看到结果放在哪
@@ -91,6 +98,7 @@ Name: "{app}\logs"
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Comment: "启动 {#AppName}"
 Name: "{group}\使用说明"; Filename: "{app}\使用说明.txt"
+Name: "{group}\修复本机连接（需管理员确认）"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\_internal\scripts\allow_loopback.ps1"""; WorkingDir: "{app}"; Comment: "仅为此程序放行 127.0.0.1 TCP 回环连接"
 Name: "{group}\识别结果目录"; Filename: "{app}\outputs"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 

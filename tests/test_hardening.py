@@ -656,10 +656,10 @@ class TestFetchHardening(unittest.TestCase):
                     {"href": "https://planetarycomputer.microsoft.com/asset?sig=abc"}
                 ).encode()
 
-        real_urlopen = frs.urllib.request.urlopen
+        real_urlopen = frs._open_verified_request
         real_assert = frs._assert_public_https_url
-        frs.urllib.request.urlopen = lambda *a, **k: _Resp()
-        frs._assert_public_https_url = lambda u: u  # 本用例只验证缓存行为
+        frs._open_verified_request = lambda *a, **k: _Resp()
+        frs._assert_public_https_url = lambda u, **kwargs: u  # 本用例只验证缓存行为
         try:
             href = "https://sentinel-s2-l2a.s3.amazonaws.com/tiles/t.tif"
             first = frs._sign_pc(href)
@@ -673,7 +673,7 @@ class TestFetchHardening(unittest.TestCase):
             frs._sign_pc(href)
             self.assertEqual(len(calls), 2, "缓存过期后应重新签名")
         finally:
-            frs.urllib.request.urlopen = real_urlopen
+            frs._open_verified_request = real_urlopen
             frs._assert_public_https_url = real_assert
             frs._SIGN_CACHE.clear()
 

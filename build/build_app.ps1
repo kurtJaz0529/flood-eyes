@@ -1,4 +1,4 @@
-# 慧眼识灾 · 一键打包脚本（Windows）
+﻿# 慧眼识灾 · 一键打包脚本（Windows）
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile lite      # 精简版（无 torch，~350MB）
 #   powershell -ExecutionPolicy Bypass -File build/build_app.ps1 -Profile full      # 完整版（含 U-Net，~900MB）
@@ -67,18 +67,22 @@ $readme = @"
   · 6 景合成演示影像（含逐像元真值，用于精度自检）
   · 七类地貌的实验场景适配、NDWI 基线与 GIS 复核图层
   · 六种本地光谱监测；SWIR 指数需要真实短波红外波段
-  · 本安装包不包含真实影像缓存与深度学习权重
+  · 精简版无深度依赖；完整版含 PyTorch CPU 和实验 U-Net 权重
+  · 安装包不包含真实影像缓存；实验权重尚未完成区域精度验收
   · 中文 PDF 简报导出
 
 【常见问题】
   Q: 双击没反应？
-  A: 看 logs\desktop.log；或改用带控制台的版本重新打包（-Console）。
+  A: 看 logs\desktop.log；本机连接失败会提示并退出，可用 --diagnose 新文件.json 导出诊断。
+     本机已通过限定 127.0.0.1 的程序规则解决回环超时，并通过 51 项界面检查。
+     如仍被系统拦截，可从开始菜单运行“修复本机连接（需管理员确认）”。
+     离线批处理用 --batch，光谱监测用 --spectral；详见 _internal\docs\安装与离线运行.md。
   Q: 端口被占用？
   A: 程序会自动从 7860 往后找可用端口，不影响使用。
   Q: 想用自己的影像？
   A: 在本地多光谱区上传 GeoTIFF。六波段预设为 B2/B3/B4/B8/B11/B12。
   Q: 想用 U-Net 深度模型？
-  A: 精简版不含 PyTorch，请使用完整版；并把训练好的权重放到 weights 文件夹。
+  A: 完整版内置实验权重，请在模型选项显式选择 U-Net。自动模式保持 NDWI 基线。
 
 【数据来源】
   Sentinel-2 L2A（ESA/Copernicus，AWS 公开 COG，Element84 Earth Search STAC）
@@ -97,13 +101,13 @@ $version = "0.5.0"
 $zipName = "慧眼识灾_v${version}_$Profile.zip"
 $zipPath = Join-Path (Get-Location) (Join-Path $distPath $zipName)
 if (-not $NoZip) {
-    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    Compress-Archive -Path $dist -DestinationPath $zipPath -CompressionLevel Optimal
+    python scripts/_make_release_zip.py --profile $Profile --source $dist --output $zipPath
+    if ($LASTEXITCODE -ne 0) { throw "ZIP 打包失败，旧 ZIP 已保留" }
 }
 
 $exe = Join-Path $dist "慧眼识灾.exe"
 $size = [math]::Round((Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
 Write-Host "`n==> 完成！" -ForegroundColor Green
 Write-Host "   exe   : $exe"
-if (Test-Path $zipPath) { Write-Host "   分发包: $zipPath（$([math]::Round((Get-Item $zipPath).Length/1MB,1)) MB）" }
+if (-not $NoZip -and (Test-Path $zipPath)) { Write-Host "   分发包: $zipPath（$([math]::Round((Get-Item $zipPath).Length/1MB,1)) MB）" }
 Write-Host "   解压后体积: $size MB"

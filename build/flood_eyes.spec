@@ -41,7 +41,7 @@ if "FLOOD_PROFILE" not in os.environ:
 # --------------------------------------------------------------------------
 datas = []
 binaries = []
-hiddenimports = []
+hiddenimports = ["src.http_range"]  # fetch_real_samples is loaded dynamically from bundled data
 
 # 1) 示例影像（合成 + 真实）
 for sub in ("samples", "real"):
@@ -67,10 +67,14 @@ for name in ("apple.css", "heye_map.js"):
         print(f"[spec] 警告：未找到 app/{name}")
 _scripts = os.path.join(ROOT, "scripts")
 if os.path.isdir(_scripts):
-    for name in ("fetch_real_samples.py", "fetch_s1_rtc.py", "check_data.py"):
+    # allow_loopback.ps1 是用户自助修复入站过滤的唯一入口，必须随包分发，
+    # 否则启动失败提示里指向的路径在安装版里不存在。
+    for name in ("fetch_real_samples.py", "fetch_s1_rtc.py", "check_data.py", "allow_loopback.ps1"):
         p = os.path.join(_scripts, name)
         if os.path.isfile(p):
             datas.append((p, "scripts"))
+        else:
+            print(f"[spec] 警告：未找到 scripts/{name}")
 
 # 1c) 应用图标：顶栏 logo（内联为 data URI）与浏览器 favicon 都读它。
 #     同样属于"运行时按路径读取"的数据文件，PyInstaller 不会自动收集。
@@ -139,8 +143,9 @@ hiddenimports += [
 # 7) 项目自身模块（函数内 import，显式兜底）
 hiddenimports += ["app", "app.main", "app.components", "app.desktop", "src"]
 hiddenimports += ["app.automation", "app.spectral", "src.adaptive_flood",
-                  "src.spectral_monitor", "src.evaluation", "src.jobs", "src.pipeline"]
-for name in ("场景适配与遥感扩展使用说明.md", "光谱时序监测使用说明.md", "自动化处理使用说明.md"):
+                  "src.spectral_monitor", "src.evaluation", "src.jobs", "src.pipeline",
+                  "scripts.run_batch", "scripts.run_spectral"]
+for name in ("场景适配与遥感扩展使用说明.md", "光谱时序监测使用说明.md", "自动化处理使用说明.md", "安装与离线运行.md", "问题修复与完整版交付_20260927.md"):
     datas.append((os.path.join(ROOT, "docs", name), "docs"))
 
 # --------------------------------------------------------------------------

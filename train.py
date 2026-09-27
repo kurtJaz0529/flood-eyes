@@ -27,6 +27,7 @@ import os
 import random
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -56,37 +57,85 @@ except Exception:  # pragma: no cover
 # --------------------------------------------------------------------------
 
 
-def _read_mask(path: str) -> np.ndarray:
-    from PIL import Image
-
-    m = np.asarray(Image.open(path))
-    if m.ndim == 3:
-        m = m[..., 0]
-    return (m > 127).astype(np.uint8)
+def _read_mask(path: str, encoding: str = "auto") -> np.ndarray:
+    """Read labels as -1=ignore, 0=land, 1=water; preserve GeoTIFF NoData."""
+    invalid = None
+    if Path(path).suffix.lower() in (".tif", ".tiff"):
+        import rasterio
+        with rasterio.open(path) as ds:
+            if ds.count != 1:
+                raise ValueError("Training labels must have one band")
+            arr = ds.read(1, masked=True)
+            invalid, m = np.ma.getmaskarray(arr), arr.data
+    else:
+        from PIL import Image
+        with Image.open(path) as image:
+            m = np.asarray(image)
+        if m.ndim != 2:
+            raise ValueError("Training labels must be single-channel")
+    valid = np.isfinite(m)
+    if invalid is not None:
+        valid &= ~invalid
+    values = set(np.unique(m[valid]).tolist())
+    if encoding == "auto":
+        encoding = "png255" if Path(path).suffix.lower() == ".png" and values <= {0, 255} else "binary"
+    allowed = {0, 255} if encoding == "png255" else {-1, 0, 1, 255}
+    if not values <= allowed:
+        raise ValueError(f"Unexpected label values: {values}")
+    result = np.full(m.shape, -1, np.float32)
+    if encoding == "png255":
+        result[valid] = (m[valid] == 255).astype(np.float32)
+    else:
+        valid &= (m == 0) | (m == 1)
+        result[valid] = m[valid]
+    return result
 
 
 def discover_samples(data_dir: str) -> List[Dict[str, str]]:
-    """在数据目录中找出 (影像, 掩膜) 配对。
-
-    支持两种组织方式：
-        1. 本仓库合成样本：demoXX_post.tif + demoXX_mask.png
-        2. Sen1Floods11 风格：*_img.tif + *_mask.tif / *_label.png
-    """
-    items: List[Dict[str, str]] = []
-    files = sorted(os.listdir(data_dir))
-    for f in files:
-        stem, ext = os.path.splitext(f)
-        if ext.lower() not in (".tif", ".tiff"):
+    """Read demo pairs or official S2Hand/LabelHand layout; group official chips by event."""
+    items, seen = [], set()
+    for image in sorted(Path(data_dir).rglob("*")):
+        if image.suffix.lower() not in (".tif", ".tiff"):
             continue
-        if not (stem.endswith("_post") or stem.endswith("_img") or stem.endswith("_S2Hand")):
+        suffix = next((x for x in ("_post", "_img", "_S2Hand") if image.stem.endswith(x)), None)
+        if suffix is None:
             continue
-        base = stem.replace("_post", "").replace("_img", "").replace("_S2Hand", "")
-        for cand in (f"{base}_mask.png", f"{base}_mask.tif", f"{base}_label.png", f"{stem}_mask.png"):
-            p = os.path.join(data_dir, cand)
-            if os.path.isfile(p):
-                items.append({"image": os.path.join(data_dir, f), "mask": p, "id": base})
-                break
+        base = image.stem[:-len(suffix)]
+        candidates = [image.parent / (base+x) for x in
+                      ("_mask.png", "_mask.tif", "_mask.tiff", "_label.png", "_label.tif", "_LabelHand.tif")]
+        candidates.append(image.parent.parent / "LabelHand" / (base+"_LabelHand.tif"))
+        mask = next((x for x in candidates if x.is_file()), None)
+        if mask is None:
+            continue
+        if base in seen:
+            raise ValueError(f"Duplicate sample id: {base}")
+        seen.add(base)
+        items.append({"image": str(image), "mask": str(mask), "id": base,
+                      "group": base.split("_")[0] if suffix == "_S2Hand" else base})
     return items
+
+
+def split_samples(items, seed=42, val_ratio=1/6, val_id=None, val_groups=None, test_groups=None):
+    test_names = set(filter(None, (test_groups or "").split(",")))
+    groups = sorted({i.get("group", i["id"]) for i in items})
+    val_names = set(filter(None, (val_groups or "").split(",")))
+    if val_id:
+        val_names |= {i.get("group", i["id"]) for i in items if i["id"] == val_id}
+        if not val_names:
+            raise ValueError(f"Unknown validation id: {val_id}")
+    if not (val_names | test_names) <= set(groups) or val_names & test_names:
+        raise ValueError("Unknown or overlapping validation/test groups")
+    if not val_names:
+        available = [g for g in groups if g not in test_names]
+        random.Random(seed).shuffle(available)
+        val_names = set(available[:max(1, round(len(available)*val_ratio))])
+    parts = [[], [], []]
+    for item in items:
+        group = item.get("group", item["id"])
+        parts[2 if group in test_names else 1 if group in val_names else 0].append(item)
+    if not parts[0] or not parts[1]:
+        raise ValueError("Training and validation need distinct nonempty groups")
+    return tuple(parts)
 
 
 class FloodDataset(Dataset):
@@ -101,6 +150,7 @@ class FloodDataset(Dataset):
         std: Optional[Sequence[float]] = None,
         band_order: str = "auto",
         repeat: int = 1,
+        label_encoding: str = "auto",
     ):
         self.items = list(items)
         self.img_size = int(img_size)
@@ -109,6 +159,7 @@ class FloodDataset(Dataset):
         self.std = tuple(std) if std else DEFAULT_STD
         self.band_order = band_order
         self.repeat = max(1, int(repeat))
+        self.label_encoding = label_encoding
 
     def __len__(self) -> int:
         return len(self.items) * self.repeat
@@ -116,7 +167,12 @@ class FloodDataset(Dataset):
     def _load(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         item = self.items[idx % len(self.items)]
         scene = load_scene(item["image"], band_order=self.band_order)
-        mask = _read_mask(item["mask"])
+        mask = _read_mask(item["mask"], self.label_encoding)
+        if Path(item["mask"]).suffix.lower() in (".tif", ".tiff"):
+            import rasterio
+            with rasterio.open(item["mask"]) as labels:
+                if labels.crs != scene.crs or not labels.transform.almost_equals(scene.transform, precision=1e-8):
+                    raise ValueError("Image and label grids/CRS do not match")
         # 通道顺序必须固定为 blue/green/red/nir：模型与归一化均按此顺序定义。
         # 原实现先过滤缺失波段、再把补零通道追加到末尾，一旦中间少一个波段
         # （例如缺 red），实际堆叠会变成 [blue, green, nir, 0] 而模型仍按
@@ -131,6 +187,11 @@ class FloodDataset(Dataset):
         chw = scene.stack(list(required))  # (4,H,W) 反射率，顺序固定
         if mask.shape != chw.shape[1:]:
             raise ValueError(f"{item['image']} 与 {item['mask']} 尺寸不一致：{chw.shape[1:]} vs {mask.shape}")
+        valid = np.isfinite(chw).all(axis=0)
+        if scene.nodata_mask is not None:
+            valid &= ~scene.nodata_mask
+        mask[~valid] = -1
+        chw[:, ~valid] = 0
         return chw, mask.astype(np.float32)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -141,7 +202,7 @@ class FloodDataset(Dataset):
         if h < s or w < s:  # 影像小于裁剪尺寸 -> 反射补边
             ph, pw = max(0, s - h), max(0, s - w)
             chw = np.pad(chw, ((0, 0), (0, ph), (0, pw)), mode="reflect")
-            mask = np.pad(mask, ((0, ph), (0, pw)), mode="reflect")
+            mask = np.pad(mask, ((0, ph), (0, pw)), mode="constant", constant_values=-1)
             c, h, w = chw.shape
 
         if self.augment:
@@ -173,24 +234,23 @@ class FloodDataset(Dataset):
         return x, y
 
 
-def compute_stats(items: Sequence[Dict[str, str]], max_pixels: int = 400_000) -> Tuple[List[float], List[float]]:
-    """从训练集统计各通道均值/标准差（只用训练集，避免验证集信息泄漏）。"""
-    acc = np.zeros(4, dtype=np.float64)
-    acc2 = np.zeros(4, dtype=np.float64)
-    n = 0
-    for it in items:
-        scene = load_scene(it["image"])
-        names = [b for b in ("blue", "green", "red", "nir") if b in scene.bands]
-        chw = scene.stack(names)
-        if chw.shape[0] < 4:
-            chw = np.concatenate([chw, np.zeros((4 - chw.shape[0], *chw.shape[1:]), np.float32)], 0)
-        flat = chw.reshape(4, -1)[:, :: max(1, chw[0].size // max(1, max_pixels // max(1, len(items))))]
+def compute_stats(items: Sequence[Dict[str, str]], max_pixels: int = 400_000,
+                  band_order: str = "auto", label_encoding: str = "auto") -> Tuple[List[float], List[float]]:
+    """Statistics on finite labelled training pixels in the exact inference channel order."""
+    acc, acc2, n = np.zeros(4, np.float64), np.zeros(4, np.float64), 0
+    dataset = FloodDataset(items, band_order=band_order, label_encoding=label_encoding)
+    for index in range(len(items)):
+        chw, labels = dataset._load(index)
+        flat = chw[:, labels >= 0].astype(np.float64)
+        flat = flat[:, ::max(1, flat.shape[1] // max(1, max_pixels // len(items)))]
         acc += flat.sum(axis=1)
         acc2 += (flat ** 2).sum(axis=1)
         n += flat.shape[1]
-    mean = acc / max(n, 1)
-    var = np.maximum(acc2 / max(n, 1) - mean ** 2, 1e-8)
-    return mean.astype(float).tolist(), np.sqrt(var).astype(float).tolist()
+    if not n:
+        raise ValueError("No valid labelled training pixels")
+    mean = acc / n
+    var = np.maximum(acc2 / n - mean ** 2, 1e-8)
+    return mean.tolist(), np.sqrt(var).tolist()
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +296,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, flo
         x = x.to(device)
         logits = model(x)
         prob = torch.sigmoid(logits).cpu().numpy()[:, 0]
-        gt = y.numpy()[:, 0] > 0.5
+        gt = y.numpy()[:, 0]
         m = segmentation_metrics(prob, gt)
         for k in agg:
             agg[k] += m[k]
@@ -288,6 +348,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--img-size", type=int, default=256)
+    ap.add_argument("--val-size", type=int, default=None, help="Validation crop size; use 512 for full Sen1Floods11 chips")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--arch", default="auto", choices=["auto", "smp", "tiny"], help="auto=有smp用smp")
@@ -304,8 +365,20 @@ def main() -> None:
     ap.add_argument("--bce-weight", type=float, default=0.5)
     ap.add_argument("--dice-weight", type=float, default=0.5)
     ap.add_argument("--patience", type=int, default=0, help=">0 时启用早停")
-    ap.add_argument("--resume", default=None, help="从权重继续训练")
+    ap.add_argument("--resume", default=None, help="从权重初始化新训练（不恢复优化器）")
+    ap.add_argument("--band-order", default="auto")
+    ap.add_argument("--label-encoding", choices=["auto", "binary", "png255"], default="auto")
+    ap.add_argument("--val-groups", default=None, help="Comma-separated validation events")
+    ap.add_argument("--test-groups", default=None, help="Events excluded from training/model selection")
+    ap.add_argument("--repeat", type=int, default=4)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--data-note", default="unverified training data")
     args = ap.parse_args()
+    if args.resume and Path(args.resume).resolve() == Path(args.out).resolve():
+        ap.error("Use a different output path when initializing from existing weights")
+    if args.resume and not Path(args.resume).is_file():
+        ap.error("Resume checkpoint does not exist")
+    torch.set_num_threads(max(1, args.threads))
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -324,28 +397,21 @@ def main() -> None:
         raise SystemExit(
             f"在 {args.data} 中没有找到 (影像, 掩膜) 配对。\n"
             "· 先跑 python data/make_samples.py 生成演示样本；\n"
-            "· 或执行 python scripts/download_data.py --dataset sen1floods11 下载真实数据。"
+            "· 或执行 python scripts/prepare_sen1floods.py 下载真实数据。"
         )
-    random.Random(args.seed).shuffle(items)
-    if args.val_id:
-        val_items = [i for i in items if i["id"] == args.val_id]
-        train_items = [i for i in items if i["id"] != args.val_id]
-    else:
-        n_val = max(1, int(round(len(items) * args.val_ratio)))
-        val_items, train_items = items[:n_val], items[n_val:]
-    if not train_items:
-        train_items = val_items
+    train_items, val_items, test_items = split_samples(items, args.seed, args.val_ratio,
+                                                      args.val_id, args.val_groups, args.test_groups)
     print(f"[data] 训练场景 {len(train_items)} 个，验证场景 {len(val_items)} 个：")
     print(f"        train={[i['id'] for i in train_items]}")
     print(f"        val  ={[i['id'] for i in val_items]}")
 
     # ---- 归一化统计（只统计训练集）----
-    mean, std = compute_stats(train_items)
+    mean, std = compute_stats(train_items, band_order=args.band_order, label_encoding=args.label_encoding)
     print(f"[norm] mean={[round(m,4) for m in mean]}")
     print(f"[norm] std ={[round(s,4) for s in std]}")
 
-    train_ds = FloodDataset(train_items, args.img_size, augment=True, mean=mean, std=std, repeat=4)
-    val_ds = FloodDataset(val_items, args.img_size, augment=False, mean=mean, std=std, repeat=1)
+    train_ds = FloodDataset(train_items, args.img_size, augment=True, mean=mean, std=std, repeat=args.repeat, band_order=args.band_order, label_encoding=args.label_encoding)
+    val_ds = FloodDataset(val_items, args.val_size or args.img_size, augment=False, mean=mean, std=std, repeat=1, band_order=args.band_order, label_encoding=args.label_encoding)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
@@ -376,7 +442,7 @@ def main() -> None:
             ) from exc
         # 严格加载：缺失/多余键说明结构不一致，静默放行会让部分层保持随机初始化。
         model.load_state_dict(state["state_dict"], strict=True)
-        print(f"[model] 已加载 {args.resume} 继续训练")
+        print(f"[model] 已加载 {args.resume} 初始化新训练")
 
     criterion = DiceBCELoss(args.bce_weight, args.dice_weight).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -434,6 +500,7 @@ def main() -> None:
                 "in_channels": 4,
                 "classes": 1,
                 "img_size": args.img_size,
+                "val_size": args.val_size or args.img_size,
                 "mean": mean,
                 "std": std,
                 "val_iou": float(metrics["iou"]),
@@ -446,7 +513,12 @@ def main() -> None:
                 "train_scenes": [i["id"] for i in train_items],
                 "val_scenes": [i["id"] for i in val_items],
                 "train_loss": float(train_loss),
-                "data_note": "synthetic demo data" if "samples" in args.data else "real imagery",
+                "data_note": "synthetic demo data" if "samples" in args.data else args.data_note,
+                "auto_eligible": False,
+                "test_scenes": [i["id"] for i in test_items],
+                "label_encoding": args.label_encoding,
+                "band_order": args.band_order,
+                "ignored_label": -1,
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             save_checkpoint(args.out, model, meta)
@@ -466,7 +538,12 @@ def main() -> None:
         "best_iou": best_iou, "best_epoch": best_epoch, "arch": info.get("arch"),
         "encoder": info.get("encoder"), "params_M": count_parameters(model) / 1e6,
         "train_scenes": [i["id"] for i in train_items], "val_scenes": [i["id"] for i in val_items],
-        "data_note": "synthetic demo data" if "samples" in args.data else "real imagery",
+        "data_note": "synthetic demo data" if "samples" in args.data else args.data_note,
+                "auto_eligible": False,
+                "test_scenes": [i["id"] for i in test_items],
+                "label_encoding": args.label_encoding,
+                "band_order": args.band_order,
+                "ignored_label": -1,
     }
     with open(os.path.join(args.log_dir, "train_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)

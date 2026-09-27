@@ -280,7 +280,7 @@ class TestAcquisitionIsMocked(PipelineTestCase):
         self.assertEqual(call["max_cloud"], self.request.max_cloud_pct)
         self.assertIs(call["allow_cloudy"], False)
         self.assertIs(call["fast"], False)
-        self.assertEqual(call["budget_s"], 120)
+        self.assertEqual(call["budget_s"], 300)
         self.assertEqual(call["out_dir"],
                          os.path.join(os.path.abspath(self.out), "acquisition_cache",
                                       self.request.cache_key))

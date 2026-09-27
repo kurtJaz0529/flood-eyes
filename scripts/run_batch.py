@@ -131,6 +131,7 @@ def main(argv=None) -> int:
         runner = QueueRunner(store, make_runner(out_dir))
         for event in runner.run_pending():
             job = event.get("job") or {}
+            had_errors = had_errors or event["event"] in ("failed", "cancelled")
             print(f"[{event['event']}] {job.get('job_id', '')} {job.get('status', '')}"
                   + (f" 错误：{job.get('error')}" if job.get("error") else ""))
         print("队列处理完毕。")

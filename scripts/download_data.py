@@ -44,16 +44,14 @@ DATASETS: Dict[str, Dict[str, object]] = {
         "url": "https://github.com/cloudtostreet/Sen1Floods11",
         "note": "446 景全球洪水影像 + 人工标注，洪水语义分割最常用的公开基准",
         "steps": [
-            "git clone https://github.com/cloudtostreet/Sen1Floods11.git",
-            "cd Sen1Floods11",
-            "python download_data.py --s2   # 只下 Sentinel-2 光学影像（约 1.2 GB）",
-            "python download_data.py --s1   # 需要雷达数据再下这个",
+            "python scripts/prepare_sen1floods.py --out data/sen1floods11/pilot --chips-per-event 4",
+            "从官方公开 GCS 下载 11 个事件共 44 幅真实光学影像与人工标签，无需账号",
         ],
         "layout": [
-            "把 Sen1Floods11/flood_events/HandLabeled/S2Hand/ 下的 *_S2Hand.tif 复制到 data/sen1floods11/",
-            "把 Sen1Floods11/flood_events/HandLabeled/LabelHand/ 下的 *_LabelHand.tif 复制过来并改名：",
-            "    xxx_S2Hand.tif  ->  xxx_post.tif",
-            "    xxx_LabelHand.tif  ->  xxx_mask.png   （0/1 二值，>127 视为水）",
+            "脚本从原始 13 波段选择 B2/B3/B4/B8，L1C TOA 按 10000 缩放",
+            "保留 *_S2Hand.tif + *_LabelHand.tif；标签 -1=忽略、0=非水、1=水",
+            "不要把 TIFF 改扩展名伪装 PNG，也不要对 0/1 标签使用 >127 阈值",
+            "按事件划分训练、验证、测试；L1C 训练模型用于 L2A 须另行验证",
         ],
         "check": ["data/sen1floods11"],
     },
@@ -94,7 +92,7 @@ def _print_dataset(key: str) -> None:
     print("【整理为本项目可识别的结构】")
     for s in d["layout"]:  # type: ignore[arg-type]
         print(f"  · {s}")
-    print("  · 目录形如：data/sen1floods11/xxx_post.tif  +  xxx_mask.png")
+    print("  · 支持 *_S2Hand.tif + *_LabelHand.tif，或 *_post.tif + *_mask.png")
     print("【训练】")
     print("  python train.py --data data/sen1floods11 --epochs 60 --img-size 512 \\")
     print("      --arch smp --encoder resnet34 --encoder-weights imagenet --batch-size 8")

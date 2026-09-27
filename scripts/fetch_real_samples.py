@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -130,7 +131,7 @@ def _is_private_ip(ip_text: str) -> bool:
     )
 
 
-def _assert_public_https_url(raw_url: str) -> str:
+def _assert_public_https_url(raw_url: str, *, local_proxy: Optional[str] = None) -> str:
     """发请求前的统一校验：协议 + 主机白名单 + 解析后 IP 不得指向内网。
 
     失败抛 `AssetRejected`（ValueError 子类）：这类失败是确定性的，
@@ -140,6 +141,8 @@ def _assert_public_https_url(raw_url: str) -> str:
     if parsed.scheme != "https":
         raise AssetRejected(f"拒绝非 https 地址：{str(raw_url)[:100]}")
     host = (parsed.hostname or "").lower()
+    if parsed.username or parsed.password or parsed.port not in (None, 443):
+        raise AssetRejected("资产地址不允许嵌入凭据或使用非标准 HTTPS 端口")
     if not _host_allowed(host):
         raise AssetRejected(f"拒绝白名单之外的资产主机：{host or '(空主机)'}")
     import socket
@@ -151,9 +154,64 @@ def _assert_public_https_url(raw_url: str) -> str:
     for info in infos:
         addr = info[4][0]
         if _is_private_ip(addr):
+            # Local explicit CONNECT proxies can use 198.18/15 as synthetic DNS.
+            # Only this range is accepted, with HTTPS/host validation unchanged.
+            import ipaddress
+            proxy = urllib.parse.urlparse(local_proxy or "")
+            if (proxy.scheme in ("http", "https") and proxy.hostname in ("127.0.0.1", "::1")
+                    and proxy.port and ipaddress.ip_address(addr) in ipaddress.ip_network("198.18.0.0/15")):
+                continue
             # 防 DNS rebinding / 被劫持的 DNS 把请求引向内网或云元数据地址
             raise AssetRejected(f"资产主机 {host} 解析到非公网地址 {addr}，已拒绝")
     return str(raw_url)
+
+
+def _configured_proxies():
+    proxies = urllib.request.getproxies()
+    # urllib ignores Windows system proxies when the GUI adds only NO_PROXY.
+    # Preserve that bypass list while restoring the configured outbound proxy.
+    if os.name == "nt" and not any(k in proxies for k in ("http", "https", "all")):
+        registry = urllib.request.getproxies_registry()
+        registry.update(proxies)
+        return registry
+    return proxies
+
+
+def _asset_local_proxy(url: str, proxies=None) -> Optional[str]:
+    proxies = _configured_proxies() if proxies is None else proxies
+    host = urllib.parse.urlparse(url).hostname or ""
+    if urllib.request.proxy_bypass(host):
+        return None
+    value = proxies.get("https", "")
+    proxy = urllib.parse.urlparse(value)
+    if proxy.scheme in ("http", "https") and proxy.hostname in ("127.0.0.1", "::1") and proxy.port:
+        return value
+    return None
+
+
+@lru_cache(maxsize=1)
+def _verified_ssl_context():
+    import ssl
+    return ssl.create_default_context()
+
+
+def _open_verified_request(request, timeout=20):
+    """Python TLS, explicit proxy snapshot, and validation at every redirect."""
+    _check_deadline()
+    proxies = _configured_proxies()
+    def validate(url):
+        return _assert_public_https_url(url, local_proxy=_asset_local_proxy(url, proxies))
+    validate(request.full_url)
+    class CheckedRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            validate(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler(proxies), CheckedRedirect(),
+        urllib.request.HTTPSHandler(context=_verified_ssl_context()))
+    if _DEADLINE is not None:
+        timeout = min(timeout, max(0.1, _DEADLINE - time.time()))
+    return opener.open(request, timeout=timeout)
 
 
 def write_json_atomic(path: str, payload: Any) -> str:
@@ -183,14 +241,15 @@ def _sign_pc(href: str) -> str:
         hit = _SIGN_CACHE.get(href)
         if hit and hit[1] > now:
             return hit[0]
-    href = _assert_public_https_url(href)
-    url = _assert_public_https_url(PC_SIGN_API + "?" + urllib.parse.urlencode({"href": href}))
+    href = _assert_public_https_url(href, local_proxy=_asset_local_proxy(href))
+    url = PC_SIGN_API + "?" + urllib.parse.urlencode({"href": href})
     last: Optional[Exception] = None
     for i in range(3):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                signed = _assert_public_https_url(str(json.load(resp)["href"]))
+            with _open_verified_request(req, timeout=20) as resp:
+                signed = str(json.load(resp)["href"])
+                signed = _assert_public_https_url(signed, local_proxy=_asset_local_proxy(signed))
             with _SIGN_LOCK:
                 _SIGN_CACHE[href] = (signed, time.time() + _SIGN_TTL_S)
             return signed
@@ -297,8 +356,65 @@ def _check_deadline() -> None:
         raise TimeoutError("在线下载超时")
 
 
+def allow_unsafe_tls() -> bool:
+    """显式选择"跳过 TLS 证书校验"的开关，默认关闭。
+
+    受限网络（无法访问 CRL/OCSP 吊销端点）下 schannel 会直接报
+    ``the revocation status is unknown`` 并拒绝所有 HTTPS 读取。GDAL 3.12 没有
+    "只关吊销检查"的配置项——核对过 DLL 里的配置名，只有全关的
+    ``GDAL_HTTP_UNSAFESSL``（``CURLSSLOPT_NO_REVOKE`` 未暴露）。因此这里只提供
+    全关的显式开关，且必须由用户自己打开；默认保持校验。
+    """
+    return os.environ.get("FLOOD_ALLOW_UNSAFE_TLS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def describe_network_error(exc: BaseException) -> str:
+    """把 GDAL/curl/urllib 的原始报错翻译成可执行的说明；无法归类时返回空串。
+
+    判定顺序有讲究：**先看 WinError 数字码，再看英文关键词**。
+    Windows 的系统错误文案会跟随系统语言本地化（本机是中文），
+    只匹配 "timed out" 这类英文短语在中文系统上会全部漏判——
+    而数字码在本地化文案里仍然原样保留（如 ``[WinError 10060]``）。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    reason = getattr(exc, "reason", None)
+    if reason is not None:
+        text += f" | {type(reason).__name__}: {reason}".lower()
+
+    if "revocation status is unknown" in text or "schannel" in text:
+        return ("证书吊销状态无法查询（schannel）：多为受限网络访问不到 CRL/OCSP 端点所致，"
+                "与影像本身无关。确认网络可信时可设 FLOOD_ALLOW_UNSAFE_TLS=1 跳过证书校验后重试"
+                "（会降低安全性，结果元数据会记 tls_verification_disabled=true）。")
+
+    # WinError 数字码：与系统语言无关
+    for code, hint in (
+        ("10060", "连接超时：目标主机在超时时间内没有响应（WSAETIMEDOUT）。"),
+        ("10061", "连接被拒绝：目标端口上没有监听者（WSAECONNREFUSED）。"),
+        ("11001", "域名解析失败：找不到该主机（WSAHOST_NOT_FOUND）。"),
+        ("10051", "网络不可达（WSAENETUNREACH）。"),
+        ("10065", "主机不可达（WSAEHOSTUNREACH）。"),
+    ):
+        if f"winerror {code}" in text or f"[{code}]" in text or f"errno {code}" in text:
+            return hint + "请检查网络连通性与代理设置后重试。"
+
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return "连接超时：目标主机不可达或被拦截，请检查网络与代理设置后重试。"
+    if isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError):
+        return "连接被拒绝：目标端口没有监听者，请稍后重试或改用本地影像。"
+
+    if "timed out" in text or "couldn't connect" in text or "failed to connect" in text:
+        return "连接超时：目标主机不可达或被拦截，请检查网络与代理设置后重试。"
+    if "could not resolve host" in text or "getaddrinfo" in text or "name or service not known" in text:
+        return "域名解析失败：请检查 DNS 与网络连通性。"
+    if "connection refused" in text:
+        return "连接被拒绝：目标端口没有监听者，请稍后重试或改用本地影像。"
+    return ""
+
+
 def _gdal_env() -> Dict[str, str]:
     env = dict(_GDAL_ENV)
+    if allow_unsafe_tls():
+        env["GDAL_HTTP_UNSAFESSL"] = "YES"
     if _DEADLINE is not None:
         left = max(8.0, _DEADLINE - time.time())
         env["GDAL_HTTP_TIMEOUT"] = str(int(min(30.0, left)))
@@ -368,6 +484,7 @@ def _with_retry(fn, attempts: int = 3, base_delay: float = 2.0, label: str = "")
     """
     last: Optional[Exception] = None
     for i in range(attempts):
+        _check_deadline()
         try:
             return fn()
         except AssetRejected:
@@ -396,12 +513,26 @@ def _with_retry(fn, attempts: int = 3, base_delay: float = 2.0, label: str = "")
 
 def _open_vsicurl(href: str):
     import rasterio
-
-    url = href if href.startswith("/vsicurl/") else "/vsicurl/" + href
-    try:
-        return rasterio.open(url)
-    except Exception:
-        return rasterio.open(href.replace("/vsicurl/", "", 1) if href.startswith("/vsicurl/") else href)
+    import uuid
+    from src.http_range import HTTPRangeReader
+    href = href.removeprefix("/vsicurl/")
+    _assert_public_https_url(href, local_proxy=_asset_local_proxy(href))
+    transport = os.environ.get("FLOOD_HTTP_TRANSPORT", "python" if os.name == "nt" else "auto").lower()
+    if transport not in ("auto", "gdal", "python"):
+        raise ValueError("FLOOD_HTTP_TRANSPORT must be auto, gdal, or python")
+    if transport != "python":
+        try:
+            return rasterio.open("/vsicurl/" + href)
+        except Exception:
+            if transport == "gdal":
+                raise
+    # Supply a virtual filename, avoiding GDAL's /vsicurl/ dispatch and signed URL logs.
+    name = "asset_" + uuid.uuid4().hex + ".tif"
+    def opener(path, mode="rb"):
+        if str(path) != name or mode not in ("r", "rb"):
+            raise FileNotFoundError(str(path))
+        return HTTPRangeReader(href, _open_verified_request, block_size=1024 * 1024, max_blocks=8)
+    return rasterio.open(name, opener=opener)
 
 
 def _utm_bounds(src_crs: Any, lon: float, lat: float, half_km: float) -> Tuple[float, float, float, float]:
@@ -445,7 +576,10 @@ def read_window(href: str, crs: Any, bounds: Tuple[float, float, float, float],
                         dst_h, dst_w = max(1, int(round(src_h))), max(1, int(round(src_w)))
                     if out is None:
                         out = np.zeros((dst_h, dst_w), dtype=np.dtype(dtype))
-                    tile = 128 if dst_h * dst_w > 128 * 128 else max(dst_h, dst_w)
+                    # Python transport already bounds every HTTP Range. Match COG tiles
+                    # instead of repeating 16 tiny GDAL reads of the same compressed tile.
+                    python_transport = os.environ.get("FLOOD_HTTP_TRANSPORT", "python" if os.name == "nt" else "auto") == "python"
+                    tile = min(512 if python_transport else 128, max(dst_h, dst_w))
                     n_y = (dst_h + tile - 1) // tile
                     n_x = (dst_w + tile - 1) // tile
                     n_tiles = n_y * n_x
@@ -468,11 +602,15 @@ def read_window(href: str, crs: Any, bounds: Tuple[float, float, float, float],
                                         window=sw,
                                         out_shape=(th, tw),
                                         resampling=Resampling.bilinear,
-                                        boundless=True,
+                                        # win was already clipped to the dataset. Boundless
+                                        # creates a VRT that repeatedly reopens Python VSI
+                                        # files and can crash GDAL on callback timeouts.
+                                        boundless=False,
                                         fill_value=0,
                                     )
                                     break
                                 except Exception as exc:
+                                    _check_deadline()
                                     tile_exc = exc
                                     time.sleep(1.5 * (attempt + 1))
                             if block is None:
@@ -586,16 +724,23 @@ def _pick_scene(
     """在候选景中挑"有效数据 + 窗口云量低 + 时间接近目标"的一景。"""
     scored: List[Tuple[float, Dict[str, Any], Dict[str, float], Tuple[float, float, float]]] = []
     n_err = 0
+    last_err: Optional[BaseException] = None
     for item in candidates:
+        _check_deadline()
         if not point_in_bbox(item["bbox"], lon, lat):
             continue
         date = item["properties"]["datetime"][:10]
         # ① 定位窗口中心的有效像元
         try:
             center = _with_retry(lambda: find_valid_center(item, lon, lat), label=item["id"])
+        except TimeoutError:
+            raise
         except Exception as exc:
             n_err += 1
-            print(f"    [skip] {item['id']}: {type(exc).__name__} {str(exc)[:100]}")
+            last_err = exc
+            hint = describe_network_error(exc)
+            print(f"    [skip] {item['id']}: {type(exc).__name__} {str(exc)[:100]}"
+                  + (f"\n           {hint}" if hint else ""))
             continue
         if center is None:
             print(f"    {date}  {item['id']:34s}  ✗ AOI 附近无有效数据")
@@ -604,9 +749,14 @@ def _pick_scene(
         # ② 评估窗口云量 / 水体 / 有效率
         try:
             q = _with_retry(lambda: scene_window_quality(item, x, y, half_km=half_km), label=item["id"])
+        except TimeoutError:
+            raise
         except Exception as exc:
             n_err += 1
-            print(f"    [skip] {item['id']}: {type(exc).__name__} {str(exc)[:100]}")
+            last_err = exc
+            hint = describe_network_error(exc)
+            print(f"    [skip] {item['id']}: {type(exc).__name__} {str(exc)[:100]}"
+                  + (f"\n           {hint}" if hint else ""))
             continue
         if q["valid_pct"] < 50:
             print(f"    {date}  {item['id']:34s}  ✗ 有效率仅 {q['valid_pct']:.0f}%")
@@ -620,6 +770,10 @@ def _pick_scene(
     if not scored:
         if n_err:
             print(f"    ✗ {n_err} 景因网络读取失败被跳过（已自动重试仍未成功，可稍后再试）")
+            if last_err is not None:
+                hint = describe_network_error(last_err)
+                if hint:
+                    print(f"    → {hint}")
         return None
     scored.sort(key=lambda x: x[0])
     best = scored[0]
@@ -706,7 +860,13 @@ def _pick_scene_stac(
         except (ValueError, TypeError):
             print(f"    [skip] {item.get('id', '?')}: 日期字段非法（{date!r}）")
             continue
-        cloud = float(props.get("eo:cloud_cover") or 100.0)
+        raw_cloud = props.get("eo:cloud_cover")
+        try:
+            cloud = float(raw_cloud) if raw_cloud is not None else 100.0
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(cloud) or not 0 <= cloud <= 100:
+            continue
         dt_days = abs((np.datetime64(date) - np.datetime64(target_date)) / np.timedelta64(1, "D"))
         scored.append((cloud + 1.5 * float(dt_days), item))
     if not scored:
@@ -716,9 +876,12 @@ def _pick_scene_stac(
 
     verified: List[Tuple[float, Dict[str, Any], Dict[str, float], Tuple[float, float, float]]] = []
     for score, item in scored[: max(1, int(verify_k))]:
+        _check_deadline()
         date = str((item.get("properties") or {}).get("datetime", ""))[:10]
         try:
             center = _with_retry(lambda: find_valid_center(item, lon, lat), label=item["id"])
+        except TimeoutError:
+            raise
         except Exception as exc:
             print(f"    [skip] {item['id']}: {type(exc).__name__} {str(exc)[:80]}")
             continue
@@ -729,6 +892,8 @@ def _pick_scene_stac(
         quality = {"cloud_pct": cloud, "water_pct": 0.0, "valid_pct": 100.0}
         try:
             quality = scene_window_quality(item, center[0], center[1], half_km=half_km)
+        except TimeoutError:
+            raise
         except Exception as exc:
             # 质检失败不能沿用 valid_pct=100 的默认值：那等于把"没测出来"当成
             # "满分景"，随后的云量判断建立在伪造数据上，可能把重云景当成首选。
@@ -1127,6 +1292,18 @@ def _cached_pair(out_dir: str, key: str, size: int,
     return pre, post, copy.deepcopy(record["entry"])
 
 
+def provenance_common() -> Dict[str, Any]:
+    """每条样本都要写的溯源信息；抽成纯函数以便离线断言。"""
+    return {
+        "source": "Sentinel-2 L2A COG · 微软 Planetary Computer / Element84 Earth Search（自动切换）",
+        "license": "Copernicus Sentinel Data Terms and Conditions (free and open)",
+        "fetch_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "note": "反射率已按 STAC 元数据应用 scale/offset，落盘为 反射率×10000 的 uint16",
+        # 降级开关必须留痕：拿到成果的人要能看出这次抓取是否校验过证书。
+        "tls_verification_disabled": allow_unsafe_tls(),
+    }
+
+
 def fetch_event(
     key: str,
     cfg: Dict[str, Any],
@@ -1220,12 +1397,7 @@ def _fetch_event_body(
 
     save_preview(entry.pop("pre_arr"), entry.pop("post_arr"), os.path.join(out_dir, entry["preview"]))
 
-    entry["provenance"].update({
-        "source": "Sentinel-2 L2A COG · 微软 Planetary Computer / Element84 Earth Search（自动切换）",
-        "license": "Copernicus Sentinel Data Terms and Conditions (free and open)",
-        "fetch_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "反射率已按 STAC 元数据应用 scale/offset，落盘为 反射率×10000 的 uint16",
-    })
+    entry["provenance"].update(provenance_common())
     # 两景 + 两幅 SCL + 预览全部落盘成功后才登记缓存；中途失败不会留下
     # "可命中"的清单，下次按未命中重新抓取。
     try:
@@ -1263,6 +1435,9 @@ def _fetch_tag(
         except Exception as exc:
             last_exc = exc
             print(f"  ✗ 检索失败 {type(exc).__name__}: {exc}")
+            hint = describe_network_error(exc)
+            if hint:
+                print(f"    → {hint}")
             continue
         if _FAST:
             print(f"  候选 {len(items)} 景，按目录云量初排并逐景验证 AOI 覆盖：")

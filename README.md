@@ -13,7 +13,7 @@
 <sub>▲ **真实 Sentinel-2 L2A 影像**：2020 年鄱阳湖特大洪水（灾前 2020-05-19 → 灾后 2020-07-15，窗口云量 4.3% / 0.1%）<br>
 识别结果：水体 44.02 km² → 154.37 km²，新增淹没 110.72 km²（NDWI 基线，单景 < 1 秒）</sub>
 
-[快速开始](#-30-秒跑起来) · [效果](#-效果与指标) · [架构](#-系统架构) · [路演材料](#-路演与答辩材料)
+[下载安装包](https://github.com/kurtJaz0529/flood-eyes/releases/latest) · [快速开始](#-30-秒跑起来) · [效果](#-效果与指标) · [架构](#-系统架构) · [路演材料](#-路演与答辩材料)
 
 </div>
 
@@ -139,8 +139,10 @@ python train.py --data data/sen1floods11 --epochs 60 --img-size 512 `
 
 | 安装包 | 体积 | 内容 |
 |---|---|---|
-| `慧眼识灾_安装程序_v0.5.0_精简版.exe` | **143.9 MB** | 场景适配洪水识别 + 六种光谱监测，无需 GPU |
-| `慧眼识灾_安装程序_v0.5.0_完整版.exe` | **247.6 MB** | PyTorch CPU + 真实标注训练的实验 TinyUNet |
+| [v0.5.0 精简版安装包](https://github.com/kurtJaz0529/flood-eyes/releases/download/v0.5.0/HuiYanShiZai-Setup-v0.5.0-Lite.exe) | **143.9 MiB** | 场景适配洪水识别 + 六种光谱监测，无需 GPU |
+| [v0.5.0 完整版安装包（推荐）](https://github.com/kurtJaz0529/flood-eyes/releases/download/v0.5.0/HuiYanShiZai-Setup-v0.5.0-Full.exe) | **247.6 MiB** | PyTorch CPU + 真实标注训练的实验 TinyUNet |
+
+[最新版发布页](https://github.com/kurtJaz0529/flood-eyes/releases/latest)提供安装包和版本说明；[SHA256 校验文件](https://github.com/kurtJaz0529/flood-eyes/releases/download/v0.5.0/SHA256SUMS.txt)可用于核对下载完整性。
 
 使用流程：双击 setup.exe → 安装 → 开始菜单/桌面启动「慧眼识灾」。
 无需管理员权限、无需装 Python；本地处理可离线，在线地图与下载需要网络。卸载走「添加或删除程序」。
@@ -450,4 +452,4 @@ python tests/test_pipeline.py
 
 完整版的“U-Net 实验模型 · 本地影像识别”支持单景与双时相。权重已内置，无需再找模型；默认仍为 NDWI。真实小型留出测试 IoU 0.837、F1 0.911，尚不代表目标区域精度。
 
-详情见 [修复与交付记录](docs/问题修复与完整版交付_20260927.md)，文件大小、SHA256 和最终报告见 [交付清单](outputs/resolution_20260927/delivery_manifest.json)。
+详情及最终验收结果见 [修复与交付记录](docs/问题修复与完整版交付_20260927.md)，安装包和 SHA256 见 [v0.5.0 发布页](https://github.com/kurtJaz0529/flood-eyes/releases/tag/v0.5.0)。
